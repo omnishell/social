@@ -1,0 +1,1595 @@
+#! /bin/bash
+
+__helper__() {
+    __social_load_omnirc() {
+        declare -gA SOCIAL_ACCOUNTS 2>/dev/null || true
+        declare -gA SOCIAL_PLATFORMS 2>/dev/null || true
+        declare -gA SOCIAL_DEFAULTS 2>/dev/null || true
+        declare -gA SOCIAL_CACHE 2>/dev/null || true
+        declare -gA SOCIAL_TEMPLATES 2>/dev/null || true
+        declare -gA SOCIAL_TEMPLATE_DIRS 2>/dev/null || true
+        declare -gA SOCIAL_CONTENT_DIRS 2>/dev/null || true
+
+        local target="${OMNIRC:-$HOME/.omnirc}"
+        if [[ -f "$target" ]]; then
+            source "$target"
+        fi
+    }
+
+    __social_save_omnirc() {
+        local target="${OMNIRC:-$HOME/.omnirc}"
+        local tmp="${target}.tmp"
+        local in_block=0
+
+        if [[ -f "$target" ]]; then
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                if [[ "$line" == "# --- SOCIAL AUTO START ---" ]]; then in_block=1; continue; fi
+                if [[ "$line" == "# --- SOCIAL AUTO END ---" ]]; then in_block=0; continue; fi
+                if (( in_block == 0 )); then printf "%s\n" "$line" >> "$tmp"; fi
+            done < "$target"
+        else
+            touch "$tmp"
+        fi
+
+        {
+            echo "# --- SOCIAL AUTO START ---"
+            echo "declare -gA SOCIAL_ACCOUNTS 2>/dev/null || true"
+            for k in "${!SOCIAL_ACCOUNTS[@]}"; do
+                echo "SOCIAL_ACCOUNTS[\"$k\"]=\"${SOCIAL_ACCOUNTS[$k]}\""
+            done
+            echo "declare -gA SOCIAL_PLATFORMS 2>/dev/null || true"
+            for k in "${!SOCIAL_PLATFORMS[@]}"; do
+                echo "SOCIAL_PLATFORMS[\"$k\"]=\"${SOCIAL_PLATFORMS[$k]}\""
+            done
+            echo "declare -gA SOCIAL_DEFAULTS 2>/dev/null || true"
+            for k in "${!SOCIAL_DEFAULTS[@]}"; do
+                echo "SOCIAL_DEFAULTS[\"$k\"]=\"${SOCIAL_DEFAULTS[$k]}\""
+            done
+            echo "declare -gA SOCIAL_CACHE 2>/dev/null || true"
+            for k in "${!SOCIAL_CACHE[@]}"; do
+                echo "SOCIAL_CACHE[\"$k\"]=\"${SOCIAL_CACHE[$k]}\""
+            done
+            echo "declare -gA SOCIAL_TEMPLATES 2>/dev/null || true"
+            for k in "${!SOCIAL_TEMPLATES[@]}"; do
+                echo "SOCIAL_TEMPLATES[\"$k\"]=\"${SOCIAL_TEMPLATES[$k]}\""
+            done
+            echo "declare -gA SOCIAL_TEMPLATE_DIRS 2>/dev/null || true"
+            for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do
+                echo "SOCIAL_TEMPLATE_DIRS[\"$k\"]=\"${SOCIAL_TEMPLATE_DIRS[$k]}\""
+            done
+            echo "declare -gA SOCIAL_CONTENT_DIRS 2>/dev/null || true"
+            for k in "${!SOCIAL_CONTENT_DIRS[@]}"; do
+                echo "SOCIAL_CONTENT_DIRS[\"$k\"]=\"${SOCIAL_CONTENT_DIRS[$k]}\""
+            done
+            echo "# --- SOCIAL AUTO END ---"
+        } >> "$tmp"
+
+        mv "$tmp" "$target"
+    }
+
+    __social_normalize_platform() {
+        case "${1,,}" in
+            lnkd|linkedin)  echo "lnkd" ;;
+            x|twitter)      echo "x" ;;
+            bsky|bluesky)   echo "bsky" ;;
+            mstdn|mastodon) echo "mstdn" ;;
+            all|\*)         echo "all" ;;
+            *)              echo "${1,,}" ;;
+        esac
+    }
+
+    __social_resolve_platform_type() {
+        __social_load_omnirc
+        local name="$1" t_env="${2:-${ENV:-global}}"
+        local p_key="${t_env}::${name}"
+        if [[ -n "${SOCIAL_PLATFORMS[$p_key]:-}" ]]; then
+            local p_type="$(__social_kv_get "${SOCIAL_PLATFORMS[$p_key]}" "type")"
+            __social_normalize_platform "$p_type"
+            return 0
+        fi
+        __social_normalize_platform "$name"
+    }
+
+    __social_platform_aliases() {
+        local raw="$1"
+        local norm="$(__social_resolve_platform_type "$raw")"
+        case "$norm" in
+            lnkd)  echo "$raw lnkd linkedin" ;;
+            x)     echo "$raw x twitter" ;;
+            bsky)  echo "$raw bsky bluesky" ;;
+            mstdn) echo "$raw mstdn mastodon" ;;
+            *)     echo "$raw" ;;
+        esac
+    }
+
+    __social_kv_get() {
+        local str=",$1," key="$2"
+        if [[ "$str" == *",${key}:"* ]]; then
+            local rest="${str#*,${key}:}"
+            echo "${rest%%,*}"
+        fi
+    }
+
+    __social_urlencode() {
+        LC_ALL=C awk -v str="$1" '
+        BEGIN {
+            for (i = 0; i <= 255; i++) ord[sprintf("%c", i)] = i
+            out = ""
+            len = length(str)
+            for (i = 1; i <= len; i++) {
+                c = substr(str, i, 1)
+                if (c ~ /[a-zA-Z0-9.~_-]/) {
+                    out = out c
+                } else {
+                    out = out sprintf("%%%02X", ord[c])
+                }
+            }
+            printf "%s\n", out
+        }'
+    }
+
+    __social_json_escape() {
+        local s="$1"
+        s="${s//\\/\\\\}"
+        s="${s//\"/\\\"}"
+        s="${s//$'\r'/}"
+        s="${s//$'\n'/\\n}"
+        s="${s//$'\t'/\\t}"
+        printf "%s" "$s"
+    }
+
+    __social_json_val() {
+        local json="$1" key="$2"
+        LC_ALL=C awk -v k="$key" '
+        BEGIN {
+            RS = "\0"
+        }
+        {
+            pat = "\"" k "\"[[:space:]]*:[[:space:]]*"
+            if (match($0, pat)) {
+                rest = substr($0, RSTART + RLENGTH)
+                if (substr(rest, 1, 1) == "\"") {
+                    rest = substr(rest, 2)
+                    out = ""
+                    esc = 0
+                    len = length(rest)
+                    for (i = 1; i <= len; i++) {
+                        c = substr(rest, i, 1)
+                        if (esc) {
+                            if (c == "n") out = out "\n"
+                            else if (c == "t") out = out "\t"
+                            else out = out c
+                            esc = 0
+                        } else if (c == "\\") {
+                            esc = 1
+                        } else if (c == "\"") {
+                            break
+                        } else {
+                            out = out c
+                        }
+                    }
+                    printf "%s", out
+                } else if (match(rest, /^[0-9a-zA-Z_.-]+/)) {
+                    val = substr(rest, RSTART, RLENGTH)
+                    if (val != "null") printf "%s", val
+                }
+            }
+        }' <<< "$json"
+    }
+
+    __social_jwt_payload() {
+        local jwt="$1"
+        [[ "$jwt" != *.*.* ]] && return 1
+        local payload="${jwt#*.}"
+        payload="${payload%%.*}"
+        payload="${payload//-/+}"
+        payload="${payload//_//}"
+        local pad=$(( (4 - ${#payload} % 4) % 4 ))
+        while (( pad > 0 )); do
+            payload+="="
+            (( pad-- ))
+        done
+        printf "%s" "$payload" | base64 -d 2>/dev/null
+    }
+
+    __social_is_draft() {
+        local val="${1,,}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        [[ "$val" == "true" || "$val" == "yes" || "$val" == "1" ]] && return 0
+        return 1
+    }
+
+    __social_builtin_template() {
+        local plat="$(__social_resolve_platform_type "$1")"
+        local tmpl="${2:-default}"
+
+        case "${plat}::${tmpl}" in
+            lnkd::article)
+                cat <<'EOF'
+---
+title: ""
+thumb: ""
+url: "https://"
+description: ""
+visibility: PUBLIC
+draft: false
+---
+<!-- Write your LinkedIn article/link commentary below. -->
+<!-- Set 'draft: true' above to save without publishing. -->
+
+EOF
+                ;;
+            lnkd::*)
+                cat <<'EOF'
+---
+title: ""
+thumb: ""
+url: ""
+description: ""
+visibility: PUBLIC
+draft: false
+---
+<!-- Write your LinkedIn post below. -->
+<!-- Set 'draft: true' above to save without publishing. -->
+
+EOF
+                ;;
+            *)
+                cat <<'EOF'
+---
+title: ""
+url: ""
+draft: false
+---
+<!-- Write your post content below. -->
+
+EOF
+                ;;
+        esac
+    }
+
+    __social_find_in_dir() {
+        local base_dir="${1%/}" plat="$2" tmpl="$3"
+        [[ ! -d "$base_dir" ]] && return 1
+
+        local aliases
+        aliases="$(__social_platform_aliases "$plat")"
+        local a ext
+
+        for a in $aliases; do
+            for ext in ".md" ".markdown" ""; do
+                if [[ -f "${base_dir}/${a}/${tmpl}${ext}" ]]; then
+                    echo "${base_dir}/${a}/${tmpl}${ext}"
+                    return 0
+                fi
+            done
+        done
+
+        for a in $aliases; do
+            for ext in ".md" ".markdown"; do
+                if [[ -f "${base_dir}/${tmpl}.${a}${ext}" ]]; then
+                    echo "${base_dir}/${tmpl}.${a}${ext}"
+                    return 0
+                elif [[ -f "${base_dir}/${tmpl}-${a}${ext}" ]]; then
+                    echo "${base_dir}/${tmpl}-${a}${ext}"
+                    return 0
+                fi
+            done
+        done
+
+        for ext in ".md" ".markdown" ""; do
+            if [[ -f "${base_dir}/${tmpl}${ext}" ]]; then
+                echo "${base_dir}/${tmpl}${ext}"
+                return 0
+            fi
+        done
+
+        return 1
+    }
+
+    __social_resolve_template_dir() {
+        __social_load_omnirc
+        local dir_name="$1" raw_plat="${2:-lnkd}"
+        local plat="$(__social_resolve_platform_type "$raw_plat")"
+
+        if [[ "$dir_name" == "builtin" && -d "$_SOCIAL_DIR/templates" ]]; then
+            echo "$_SOCIAL_DIR/templates"
+            return 0
+        elif [[ "$dir_name" == "user" || "$dir_name" == "omni" ]]; then
+            mkdir -p "${OMNI:-$HOME/.omni}/social/templates" 2>/dev/null || true
+            echo "${OMNI:-$HOME/.omni}/social/templates"
+            return 0
+        fi
+
+        local k
+        for k in "${raw_plat}::${dir_name}" "${plat}::${dir_name}" "all::${dir_name}"; do
+            if [[ -n "${SOCIAL_TEMPLATE_DIRS[$k]:-}" ]]; then
+                echo "${SOCIAL_TEMPLATE_DIRS[$k]}"
+                return 0
+            fi
+        done
+
+        for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do
+            if [[ "${k#*::}" == "$dir_name" ]]; then
+                echo "${SOCIAL_TEMPLATE_DIRS[$k]}"
+                return 0
+            fi
+        done
+
+        if [[ -d "$dir_name" ]]; then
+            echo "$(cd "$dir_name" && pwd)"
+            return 0
+        fi
+
+        return 1
+    }
+
+    __social_resolve_template_path() {
+        __social_load_omnirc
+        local raw_plat="$1"
+        local plat="$(__social_resolve_platform_type "$raw_plat")"
+        local tmpl="${2:-default}"
+        local filter_dir="${3:-}"
+        tmpl="${tmpl%.md}"
+
+        if [[ -f "$2" ]]; then
+            echo "$2"
+            return 0
+        fi
+
+        if [[ -n "$filter_dir" ]]; then
+            local target_d=""
+            if target_d="$(__social_resolve_template_dir "$filter_dir" "$raw_plat")"; then
+                local found_in_d=""
+                if found_in_d="$(__social_find_in_dir "$target_d" "$raw_plat" "$tmpl")"; then
+                    echo "$found_in_d"
+                    return 0
+                fi
+            fi
+            return 1
+        fi
+
+        local k
+        for k in "${raw_plat}::${tmpl}" "${plat}::${tmpl}"; do
+            if [[ -n "${SOCIAL_TEMPLATES[$k]:-}" && -f "${SOCIAL_TEMPLATES[$k]}" ]]; then
+                echo "${SOCIAL_TEMPLATES[$k]}"
+                return 0
+            fi
+        done
+
+        for k in "${raw_plat}::${tmpl}" "${plat}::${tmpl}" "all::${tmpl}"; do
+            if [[ -n "${SOCIAL_TEMPLATE_DIRS[$k]:-}" ]]; then
+                local found_in_named=""
+                if found_in_named="$(__social_find_in_dir "${SOCIAL_TEMPLATE_DIRS[$k]}" "$raw_plat" "default")"; then
+                    echo "$found_in_named"
+                    return 0
+                fi
+            fi
+        done
+
+        local found_path=""
+        for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do
+            if [[ "$k" == "${raw_plat}::"* || "$k" == "${plat}::"* ]]; then
+                if found_path="$(__social_find_in_dir "${SOCIAL_TEMPLATE_DIRS[$k]}" "$raw_plat" "$tmpl")"; then
+                    echo "$found_path"
+                    return 0
+                fi
+            fi
+        done
+
+        for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do
+            if [[ "$k" == "all::"* ]]; then
+                if found_path="$(__social_find_in_dir "${SOCIAL_TEMPLATE_DIRS[$k]}" "$raw_plat" "$tmpl")"; then
+                    echo "$found_path"
+                    return 0
+                fi
+            fi
+        done
+
+        if found_path="$(__social_find_in_dir "${OMNI:-$HOME/.omni}/social/templates" "$raw_plat" "$tmpl")"; then
+            echo "$found_path"
+            return 0
+        fi
+        if found_path="$(__social_find_in_dir "$_SOCIAL_DIR/templates" "$raw_plat" "$tmpl")"; then
+            echo "$found_path"
+            return 0
+        fi
+
+        return 1
+    }
+
+    __social_write_template_to() {
+        local plat="$1" tmpl="${2:-default}" dest="$3"
+        local resolved_path=""
+        if resolved_path="$(__social_resolve_template_path "$plat" "$tmpl")"; then
+            cp "$resolved_path" "$dest"
+            if ! grep -q '^draft:' "$dest" 2>/dev/null; then
+                LC_ALL=C awk '
+                NR == 1 && /^---[[:space:]]*$/ { print; print "draft: false"; next }
+                { print }' "$dest" > "${dest}.tmp" && mv "${dest}.tmp" "$dest"
+            fi
+            return 0
+        fi
+
+        if [[ "$tmpl" != "default" && "$tmpl" != "article" ]]; then
+            __log "Template '$tmpl' not found for platform '$plat' in any registered template directory." -t error -l social
+            return 1
+        fi
+
+        __social_builtin_template "$plat" "$tmpl" > "$dest"
+        return 0
+    }
+
+    __social_list_template_dirs() {
+        __social_load_omnirc
+        local plat="$(__social_resolve_platform_type "${1:-lnkd}")"
+        local -A dirs=()
+        local k
+        for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do
+            if [[ "$k" == "${1}::"* || "$k" == "${plat}::"* || "$k" == "all::"* ]]; then
+                dirs["${k#*::}"]=1
+            fi
+        done
+        echo "${!dirs[*]}"
+    }
+
+    __social_list_template_names() {
+        __social_load_omnirc
+        local raw_plat="${1:-lnkd}"
+        local filter_dir="${2:-}"
+        local plat="$(__social_resolve_platform_type "$raw_plat")"
+        local aliases="$(__social_platform_aliases "$raw_plat")"
+        local -A names=()
+        local k d a f bname
+
+        local -a search_dirs=()
+        if [[ -n "$filter_dir" ]]; then
+            local resolved_d=""
+            if resolved_d="$(__social_resolve_template_dir "$filter_dir" "$raw_plat")"; then
+                search_dirs=("$resolved_d")
+            fi
+        else
+            names["default"]=1
+            names["article"]=1
+            for k in "${!SOCIAL_TEMPLATES[@]}"; do
+                if [[ "$k" == "${raw_plat}::"* || "$k" == "${plat}::"* ]]; then
+                    names["${k#*::}"]=1
+                fi
+            done
+            search_dirs=(
+                "$_SOCIAL_DIR/templates"
+                "${OMNI:-$HOME/.omni}/social/templates"
+            )
+            for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do
+                if [[ "$k" == "${raw_plat}::"* || "$k" == "${plat}::"* || "$k" == "all::"* ]]; then
+                    search_dirs+=("${SOCIAL_TEMPLATE_DIRS[$k]}")
+                fi
+            done
+        fi
+
+        shopt -s nullglob
+        for d in "${search_dirs[@]}"; do
+            [[ ! -d "$d" ]] && continue
+            for a in $aliases; do
+                for f in "$d/$a"/*.md "$d/$a"/*.markdown; do
+                    bname="${f##*/}"; bname="${bname%.*}"
+                    names["$bname"]=1
+                done
+            done
+            for f in "$d"/*.md "$d"/*.markdown; do
+                bname="${f##*/}"; bname="${bname%.*}"
+                for a in $aliases; do
+                    bname="${bname%.$a}"
+                    bname="${bname%-$a}"
+                done
+                names["$bname"]=1
+            done
+        done
+        shopt -u nullglob
+
+        echo "${!names[*]}"
+    }
+
+    __social_parse_markdown() {
+        local file="$1"
+        [[ ! -f "$file" ]] && return 1
+
+        declare -gA SOCIAL_FM=()
+        declare -g SOCIAL_BODY=""
+
+        local parsed_out
+        parsed_out="$(LC_ALL=C awk '
+        BEGIN {
+            state = 0
+            body = ""
+        }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            if (NR == 1 && line ~ /^---[[:space:]]*$/) {
+                state = 1
+                next
+            }
+            if (state == 1) {
+                if (line ~ /^(---|\.\.\.)[[:space:]]*$/) {
+                    state = 2
+                    next
+                }
+                if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+                idx = index(line, ":")
+                if (idx > 0) {
+                    k = substr(line, 1, idx - 1)
+                    v = substr(line, idx + 1)
+                    sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k)
+                    sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+                    if ((v ~ /^".*"$/) || (v ~ /^\x27.*\x27$/)) {
+                        v = substr(v, 2, length(v) - 2)
+                    }
+                    printf "FM\x1F%s\x1F%s\n", tolower(k), v
+                }
+                next
+            }
+            gsub(/<!--[^>]*-->/, "", line)
+            body = body line "\n"
+        }
+        END {
+            sub(/^[[:space:]\n]+/, "", body)
+            sub(/[[:space:]\n]+$/, "", body)
+            gsub(/\n/, "\x1E", body)
+            printf "BODY\x1F%s\n", body
+        }' "$file")"
+
+        local rec_type k v
+        while IFS=$'\x1F' read -r rec_type k v; do
+            if [[ "$rec_type" == "FM" ]]; then
+                SOCIAL_FM["$k"]="$v"
+            elif [[ "$rec_type" == "BODY" ]]; then
+                SOCIAL_BODY="${k//$'\x1E'/$'\n'}"
+            fi
+        done <<< "$parsed_out"
+    }
+
+    __social_list_platforms() {
+        __social_load_omnirc
+        local t_env="${ENV:-global}"
+        local -A plats=()
+        local k
+        for k in "${!SOCIAL_PLATFORMS[@]}"; do
+            [[ "$k" == "${t_env}::"* ]] && plats["${k#*::}"]=1
+        done
+        for k in "${!SOCIAL_ACCOUNTS[@]}"; do
+            if [[ "$k" == "${t_env}::"* ]]; then
+                local rest="${k#*::}"
+                local p_type="${rest%%::*}"
+                local p_acc="${rest#*::}"
+                [[ "$p_acc" == "default" ]] && plats["$p_type"]=1 || plats["$p_acc"]=1
+            fi
+        done
+        echo "${!plats[*]}"
+    }
+
+    __social_helper_platform() {
+        __social_load_omnirc
+        local subcmd="${1:-ls}"
+        [[ $# -gt 0 ]] && shift
+
+        case "$subcmd" in
+            ls|list)
+                local t_env="${ENV:-global}" is_all=0 filter_plat=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -e|--env) t_env="$2"; shift 2 ;;
+                        --env=*)  t_env="${1#*=}"; shift ;;
+                        -a|--all) is_all=1; shift ;;
+                        -p|--platform) filter_plat="$2"; shift 2 ;;
+                        *) filter_plat="$1"; shift ;;
+                    esac
+                done
+
+                local found=0 k
+                local -A printed=()
+
+                for k in "${!SOCIAL_PLATFORMS[@]}"; do
+                    local k_env="${k%%::*}"
+                    local k_name="${k#*::}"
+                    if (( ! is_all )) && [[ "$k_env" != "$t_env" ]]; then continue; fi
+                    if [[ -n "$filter_plat" && "$k_name" != "$filter_plat" ]]; then continue; fi
+
+                    local p_data="${SOCIAL_PLATFORMS[$k]}"
+                    local p_type="$(__social_kv_get "$p_data" "type")"
+                    local p_acc="$(__social_kv_get "$p_data" "account")"
+                    [[ -z "$p_acc" ]] && p_acc="$k_name"
+                    local norm_type="$(__social_normalize_platform "$p_type")"
+
+                    local acc_key="${k_env}::${norm_type}::${p_acc}"
+                    local acc_data="${SOCIAL_ACCOUNTS[$acc_key]:-}"
+                    local urn="$(__social_kv_get "$acc_data" "urn")"
+                    local prof_name="$(__social_kv_get "$acc_data" "name")"
+                    local def_acc="${SOCIAL_DEFAULTS["${k_env}::${norm_type}"]:-}"
+                    local marker=" "
+                    [[ "$p_acc" == "$def_acc" ]] && marker="*"
+
+                    if (( is_all )); then
+                        printf "%s [%s] %-14s type: %-10s urn: %-30s %s\n" \
+                            "$marker" "$k_env" "$k_name" "${p_type:-linkedin}" "${urn:-N/A}" "${prof_name:+(${prof_name})}"
+                    else
+                        printf "%s %-14s type: %-10s urn: %-30s %s\n" \
+                            "$marker" "$k_name" "${p_type:-linkedin}" "${urn:-N/A}" "${prof_name:+(${prof_name})}"
+                    fi
+                    printed["$acc_key"]=1
+                    found=1
+                done
+
+                for k in "${!SOCIAL_ACCOUNTS[@]}"; do
+                    [[ -n "${printed[$k]:-}" ]] && continue
+                    local k_env="${k%%::*}"
+                    local rest="${k#*::}"
+                    local k_plat="${rest%%::*}"
+                    local k_acc="${rest#*::}"
+
+                    if (( ! is_all )) && [[ "$k_env" != "$t_env" ]]; then continue; fi
+                    if [[ -n "$filter_plat" && "$k_plat" != "$(__social_normalize_platform "$filter_plat")" && "$k_acc" != "$filter_plat" ]]; then
+                        continue
+                    fi
+
+                    local data="${SOCIAL_ACCOUNTS[$k]}"
+                    local urn="$(__social_kv_get "$data" "urn")"
+                    local name="$(__social_kv_get "$data" "name")"
+                    local def_acc="${SOCIAL_DEFAULTS["${k_env}::${k_plat}"]:-}"
+                    local marker=" "
+                    [[ "$k_acc" == "$def_acc" ]] && marker="*"
+
+                    local disp_name="$k_acc"
+                    [[ "$disp_name" == "default" ]] && disp_name="$k_plat"
+                    local type_label="$k_plat"
+                    [[ "$k_plat" == "lnkd" ]] && type_label="linkedin"
+
+                    if (( is_all )); then
+                        printf "%s [%s] %-14s type: %-10s urn: %-30s %s\n" \
+                            "$marker" "$k_env" "$disp_name" "$type_label" "${urn:-N/A}" "${name:+(${name})}"
+                    else
+                        printf "%s %-14s type: %-10s urn: %-30s %s\n" \
+                            "$marker" "$disp_name" "$type_label" "${urn:-N/A}" "${name:+(${name})}"
+                    fi
+                    found=1
+                done
+
+                if (( ! found )); then
+                    __log "No registered platforms found. Use: social platform set <platform> -t linkedin <data>" -t info -l social
+                fi
+                ;;
+
+            set|new|connect)
+                local plat_name="" plat_type="" t_env="${ENV:-global}"
+                local -a passthrough=()
+
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -t|--type)
+                            plat_type="$2"
+                            shift 2
+                            ;;
+                        --type=*)
+                            plat_type="${1#*=}"
+                            shift
+                            ;;
+                        --token)
+                            passthrough+=("--token" "$2")
+                            shift 2
+                            ;;
+                        --token=*)
+                            passthrough+=("--token=${1#*=}")
+                            shift
+                            ;;
+                        -e|--env)
+                            t_env="$2"
+                            passthrough+=("-e" "$2")
+                            shift 2
+                            ;;
+                        --env=*)
+                            t_env="${1#*=}"
+                            passthrough+=("$1")
+                            shift
+                            ;;
+                        *)
+                            if [[ -z "$plat_name" && "$1" != -* ]]; then
+                                plat_name="$1"
+                            else
+                                passthrough+=("$1")
+                            fi
+                            shift
+                            ;;
+                    esac
+                done
+
+                if [[ -z "$plat_name" ]]; then
+                    __log "Usage: social platform set <platform> -t/--type linkedin <data>" -t error -l social
+                    return 1
+                fi
+
+                if [[ -z "$plat_type" ]]; then
+                    case "${plat_name,,}" in
+                        lnkd|linkedin) plat_type="linkedin" ;;
+                        *)
+                            __log "Platform type (-t/--type linkedin) is required when registering '$plat_name'." -t error -l social
+                            return 1
+                            ;;
+                    esac
+                fi
+
+                local norm_type="$(__social_normalize_platform "$plat_type")"
+                local acc_name="$plat_name"
+
+                case "$norm_type" in
+                    lnkd)
+                        __social_lnkd_set --account "$acc_name" -e "$t_env" "${passthrough[@]}" || return 1
+                        SOCIAL_PLATFORMS["${t_env}::${plat_name}"]="type:linkedin,account:${acc_name}"
+                        __social_save_omnirc
+                        ;;
+                    *)
+                        __log "Unsupported platform type: '$plat_type'" -t error -l social
+                        return 1
+                        ;;
+                esac
+                ;;
+
+            rm|delete|disconnect)
+                local plat_name="" acc="" t_env="${ENV:-global}"
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -a|--account) acc="$2"; shift 2 ;;
+                        --account=*)  acc="${1#*=}"; shift ;;
+                        -e|--env)     t_env="$2"; shift 2 ;;
+                        --env=*)      t_env="${1#*=}"; shift ;;
+                        *)
+                            if [[ -z "$plat_name" ]]; then plat_name="$1"
+                            elif [[ -z "$acc" ]]; then acc="$1"
+                            fi
+                            shift
+                            ;;
+                    esac
+                done
+
+                [[ -z "$plat_name" ]] && { __log "Usage: social platform rm <platform>" -t error -l social; return 1; }
+
+                local p_key="${t_env}::${plat_name}"
+                local removed=0
+
+                if [[ -n "${SOCIAL_PLATFORMS[$p_key]:-}" ]]; then
+                    local p_data="${SOCIAL_PLATFORMS[$p_key]}"
+                    local p_type="$(__social_normalize_platform "$(__social_kv_get "$p_data" "type")")"
+                    local p_acc="$(__social_kv_get "$p_data" "account")"
+                    unset "SOCIAL_PLATFORMS[$p_key]"
+                    unset "SOCIAL_ACCOUNTS[${t_env}::${p_type}::${p_acc}]"
+                    unset "SOCIAL_CACHE[${t_env}::${p_type}::${p_acc}]"
+                    if [[ "${SOCIAL_DEFAULTS["${t_env}::${p_type}"]:-}" == "$p_acc" ]]; then
+                        unset "SOCIAL_DEFAULTS[${t_env}::${p_type}]"
+                    fi
+                    removed=1
+                fi
+
+                local norm_plat="$(__social_normalize_platform "$plat_name")"
+                local target_acc="${acc:-$plat_name}"
+                [[ "$norm_plat" == "lnkd" && -z "$acc" && -z "${SOCIAL_ACCOUNTS[${t_env}::lnkd::${target_acc}]:-}" ]] && target_acc="default"
+
+                if [[ -n "${SOCIAL_ACCOUNTS[${t_env}::${norm_plat}::${target_acc}]:-}" ]]; then
+                    unset "SOCIAL_ACCOUNTS[${t_env}::${norm_plat}::${target_acc}]"
+                    unset "SOCIAL_CACHE[${t_env}::${norm_plat}::${target_acc}]"
+                    if [[ "${SOCIAL_DEFAULTS["${t_env}::${norm_plat}"]:-}" == "$target_acc" ]]; then
+                        unset "SOCIAL_DEFAULTS[${t_env}::${norm_plat}]"
+                    fi
+                    removed=1
+                elif [[ -n "${SOCIAL_ACCOUNTS[${t_env}::lnkd::${plat_name}]:-}" ]]; then
+                    unset "SOCIAL_ACCOUNTS[${t_env}::lnkd::${plat_name}]"
+                    unset "SOCIAL_CACHE[${t_env}::lnkd::${plat_name}]"
+                    removed=1
+                fi
+
+                if (( removed )); then
+                    __social_save_omnirc
+                    __log "Removed registered platform '$plat_name'." -t success -l social
+                else
+                    __log "Platform '$plat_name' not found in env '$t_env'." -t error -l social
+                    return 1
+                fi
+                ;;
+
+            use)
+                local plat_name="" t_env="${ENV:-global}"
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -e|--env) t_env="$2"; shift 2 ;;
+                        --env=*)  t_env="${1#*=}"; shift ;;
+                        *)        [[ -z "$plat_name" ]] && plat_name="$1"; shift ;;
+                    esac
+                done
+                [[ -z "$plat_name" ]] && { __log "Usage: social platform use <platform>" -t error -l social; return 1; }
+                local p_key="${t_env}::${plat_name}"
+                if [[ -n "${SOCIAL_PLATFORMS[$p_key]:-}" ]]; then
+                    local p_data="${SOCIAL_PLATFORMS[$p_key]}"
+                    local p_type="$(__social_normalize_platform "$(__social_kv_get "$p_data" "type")")"
+                    local p_acc="$(__social_kv_get "$p_data" "account")"
+                    SOCIAL_DEFAULTS["${t_env}::${p_type}"]="$p_acc"
+                    __social_save_omnirc
+                    __log "Active platform for '$p_type' set to '$plat_name'." -t success -l social
+                    return 0
+                fi
+                if [[ -n "${SOCIAL_ACCOUNTS[${t_env}::lnkd::${plat_name}]:-}" ]]; then
+                    SOCIAL_DEFAULTS["${t_env}::lnkd"]="$plat_name"
+                    __social_save_omnirc
+                    __log "Active LinkedIn platform set to '$plat_name'." -t success -l social
+                    return 0
+                fi
+                __log "Platform '$plat_name' not found." -t error -l social
+                return 1
+                ;;
+
+            get|info)
+                local plat_name="${1:-}" target="${2:-me}" t_env="${ENV:-global}"
+                [[ -z "$plat_name" ]] && { __log "Usage: social platform get <platform> [<urn|me>]" -t error -l social; return 1; }
+                local p_type="$(__social_resolve_platform_type "$plat_name" "$t_env")"
+                local p_acc="$plat_name"
+                if [[ -n "${SOCIAL_PLATFORMS[${t_env}::${plat_name}]:-}" ]]; then
+                    p_acc="$(__social_kv_get "${SOCIAL_PLATFORMS[${t_env}::${plat_name}]}" "account")"
+                elif [[ -z "${SOCIAL_ACCOUNTS[${t_env}::lnkd::${p_acc}]:-}" ]]; then
+                    p_acc="default"
+                fi
+                case "$p_type" in
+                    lnkd) __social_lnkd_get -a "$p_acc" -e "$t_env" "$target" ;;
+                    *) __log "Unsupported platform '$plat_name'." -t error -l social; return 1 ;;
+                esac
+                ;;
+
+            *)
+                __log "Unknown platform command: '$subcmd' (use ls, set, rm, use, get)." -t error -l social
+                return 1
+                ;;
+        esac
+    }
+
+    __social_list_content_dirs() {
+        __social_load_omnirc
+        echo "${!SOCIAL_CONTENT_DIRS[*]}"
+    }
+
+    __social_list_content_items() {
+        __social_load_omnirc
+        local target_dir="${1:-}"
+        local -A items=()
+        local d path f rel
+
+        for d in "${!SOCIAL_CONTENT_DIRS[@]}"; do
+            [[ -n "$target_dir" && "$d" != "$target_dir" ]] && continue
+            path="${SOCIAL_CONTENT_DIRS[$d]}"
+            [[ ! -d "$path" ]] && continue
+            while IFS= read -r -d '' f; do
+                rel="${f#$path/}"
+                rel="${rel%.md}"
+                rel="${rel%.markdown}"
+                items["$rel"]=1
+            done < <(find "$path" -type f \( -name "*.md" -o -name "*.markdown" \) -print0 2>/dev/null)
+        done
+        echo "${!items[*]}"
+    }
+
+    __social_resolve_content_file() {
+        __social_load_omnirc
+        local content_name="$1" dir_name="${2:-}"
+
+        if [[ -f "$content_name" ]]; then
+            echo "$(cd "$(dirname "$content_name")" && pwd)/$(basename "$content_name")"
+            return 0
+        fi
+
+        local clean_name="${content_name%.md}"
+        clean_name="${clean_name%.markdown}"
+
+        local -a search_keys=()
+        if [[ -n "$dir_name" ]]; then
+            if [[ -n "${SOCIAL_CONTENT_DIRS[$dir_name]:-}" ]]; then
+                search_keys=("$dir_name")
+            elif [[ -d "$dir_name" ]]; then
+                local base="${dir_name%/}"
+                local ext
+                for ext in ".md" ".markdown" ""; do
+                    if [[ -f "${base}/${clean_name}${ext}" ]]; then
+                        echo "${base}/${clean_name}${ext}"
+                        return 0
+                    fi
+                done
+                return 1
+            else
+                __log "Content directory '$dir_name' is not registered. Use 'social content set $dir_name <path>'." -t error -l social
+                return 1
+            fi
+        else
+            search_keys=("${!SOCIAL_CONTENT_DIRS[@]}")
+        fi
+
+        local k base ext
+        for k in "${search_keys[@]}"; do
+            base="${SOCIAL_CONTENT_DIRS[$k]%/}"
+            [[ ! -d "$base" ]] && continue
+            for ext in ".md" ".markdown" ""; do
+                if [[ -f "${base}/${clean_name}${ext}" ]]; then
+                    echo "${base}/${clean_name}${ext}"
+                    return 0
+                fi
+                if [[ -f "${base}/${clean_name//./\/}${ext}" ]]; then
+                    echo "${base}/${clean_name//./\/}${ext}"
+                    return 0
+                fi
+            done
+        done
+
+        return 1
+    }
+
+    __social_helper_content() {
+        __social_load_omnirc
+        local subcmd="${1:-ls}"
+        [[ $# -gt 0 ]] && shift
+
+        case "$subcmd" in
+            set|add)
+                local dir_name="" dir_path=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -p|--path|-d|--dir) dir_path="$2"; shift 2 ;;
+                        --path=*|--dir=*)   dir_path="${1#*=}"; shift ;;
+                        *)
+                            if [[ -z "$dir_name" ]]; then dir_name="$1"
+                            elif [[ -z "$dir_path" ]]; then dir_path="$1"
+                            fi
+                            shift
+                            ;;
+                    esac
+                done
+
+                if [[ -z "$dir_path" && -n "$dir_name" && ( -d "$dir_name" || "$dir_name" == */* ) ]]; then
+                    dir_path="$dir_name"
+                    dir_name="${dir_path%/}"
+                    dir_name="${dir_name##*/}"
+                fi
+
+                if [[ -z "$dir_name" || -z "$dir_path" ]]; then
+                    __log "Usage: social content set <dir_name> <dir_path>" -t error -l social
+                    return 1
+                fi
+
+                mkdir -p "$dir_path" 2>/dev/null || {
+                    __log "Cannot create or access directory: $dir_path" -t error -l social
+                    return 1
+                }
+                local abs_dir
+                abs_dir="$(cd "$dir_path" 2>/dev/null && pwd)"
+                SOCIAL_CONTENT_DIRS["$dir_name"]="$abs_dir"
+                __social_save_omnirc
+                __log "Registered content directory '$dir_name' -> $abs_dir" -t success -l social
+                ;;
+
+            ls|list)
+                local filter_dir="" only_dirs=0
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -d|--dir)  filter_dir="$2"; shift 2 ;;
+                        --dir=*)   filter_dir="${1#*=}"; shift ;;
+                        --dirs)    only_dirs=1; shift ;;
+                        *)         [[ -z "$filter_dir" ]] && filter_dir="$1"; shift ;;
+                    esac
+                done
+
+                if [[ ${#SOCIAL_CONTENT_DIRS[@]} -eq 0 ]]; then
+                    __log "No content directories registered. Run 'social content set <dir_name> <dir_path>'." -t info -l social
+                    return 0
+                fi
+
+                if (( only_dirs )); then
+                    local k
+                    for k in "${!SOCIAL_CONTENT_DIRS[@]}"; do
+                        printf "%-16s -> %s\n" "$k" "${SOCIAL_CONTENT_DIRS[$k]}"
+                    done
+                    return 0
+                fi
+
+                local -a target_dirs=()
+                if [[ -n "$filter_dir" ]]; then
+                    if [[ -z "${SOCIAL_CONTENT_DIRS[$filter_dir]:-}" ]]; then
+                        __log "Content directory '$filter_dir' is not registered." -t error -l social
+                        return 1
+                    fi
+                    target_dirs=("$filter_dir")
+                else
+                    target_dirs=("${!SOCIAL_CONTENT_DIRS[@]}")
+                fi
+
+                local d d_path f rel slug
+                for d in "${target_dirs[@]}"; do
+                    d_path="${SOCIAL_CONTENT_DIRS[$d]%/}"
+                    printf "[%s] (%s)\n" "$d" "$d_path"
+                    if [[ ! -d "$d_path" ]]; then
+                        echo "  (directory missing)"
+                        continue
+                    fi
+
+                    local -a files=()
+                    while IFS= read -r -d '' f; do
+                        files+=("$f")
+                    done < <(find "$d_path" -type f \( -name "*.md" -o -name "*.markdown" \) -print0 2>/dev/null | LC_ALL=C sort -z)
+
+                    if [[ ${#files[@]} -eq 0 ]]; then
+                        echo "  (no markdown files)"
+                        continue
+                    fi
+
+                    for f in "${files[@]}"; do
+                        rel="${f#$d_path/}"
+                        slug="${rel%.md}"
+                        slug="${slug%.markdown}"
+                        local info
+                        info="$(LC_ALL=C awk '
+                        BEGIN { state = 0; title = ""; draft = "false" }
+                        NR == 1 && /^---[[:space:]]*$/ { state = 1; next }
+                        state == 1 {
+                            if (/^(---|\.\.\.)[[:space:]]*$/) { exit }
+                            if (tolower($0) ~ /^title[[:space:]]*:/) {
+                                v = substr($0, index($0, ":") + 1)
+                                sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+                                gsub(/^["\x27]|["\x27]$/, "", v)
+                                title = v
+                            } else if (tolower($0) ~ /^draft[[:space:]]*:/) {
+                                v = tolower(substr($0, index($0, ":") + 1))
+                                sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+                                gsub(/^["\x27]|["\x27]$/, "", v)
+                                draft = v
+                            }
+                        }
+                        END {
+                            badge = (draft == "true" || draft == "yes" || draft == "1") ? "[DRAFT]" : "[READY]"
+                            printf "%-8s %s", badge, title
+                        }' "$f")"
+                        printf "  %-28s %s\n" "$slug" "$info"
+                    done
+                done
+                ;;
+
+            get|cat|show)
+                local content_name="" dir_name=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -d|--dir) dir_name="$2"; shift 2 ;;
+                        --dir=*)  dir_name="${1#*=}"; shift ;;
+                        *)        [[ -z "$content_name" ]] && content_name="$1"; shift ;;
+                    esac
+                done
+                [[ -z "$content_name" ]] && { __log "Usage: social content get <content> [-d <content_dir>]" -t error -l social; return 1; }
+                local resolved=""
+                if ! resolved="$(__social_resolve_content_file "$content_name" "$dir_name")"; then
+                    __log "Content '$content_name' not found${dir_name:+ in '$dir_name'}." -t error -l social
+                    return 1
+                fi
+                cat "$resolved"
+                ;;
+
+            edit)
+                local content_name="" dir_name=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -d|--dir) dir_name="$2"; shift 2 ;;
+                        --dir=*)  dir_name="${1#*=}"; shift ;;
+                        *)        [[ -z "$content_name" ]] && content_name="$1"; shift ;;
+                    esac
+                done
+                [[ -z "$content_name" ]] && { __log "Usage: social content edit <content> [-d <content_dir>]" -t error -l social; return 1; }
+                local resolved=""
+                if ! resolved="$(__social_resolve_content_file "$content_name" "$dir_name")"; then
+                    __log "Content '$content_name' not found${dir_name:+ in '$dir_name'}." -t error -l social
+                    return 1
+                fi
+                "${EDITOR:-vim}" "$resolved" </dev/tty >/dev/tty
+                __log "Saved content: $resolved" -t success -l social
+                ;;
+
+            new|create)
+                local content_name="" dir_name="" tmpl_name="default" plat="lnkd"
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -d|--dir)      dir_name="$2"; shift 2 ;;
+                        --dir=*)       dir_name="${1#*=}"; shift ;;
+                        -t|--template) tmpl_name="$2"; shift 2 ;;
+                        --template=*)  tmpl_name="${1#*=}"; shift ;;
+                        -p|-P|--platform) plat="$2"; shift 2 ;;
+                        --platform=*)  plat="${1#*=}"; shift ;;
+                        *)             [[ -z "$content_name" ]] && content_name="$1"; shift ;;
+                    esac
+                done
+
+                if [[ -z "$dir_name" ]]; then
+                    if [[ ${#SOCIAL_CONTENT_DIRS[@]} -eq 1 ]]; then
+                        local k
+                        for k in "${!SOCIAL_CONTENT_DIRS[@]}"; do dir_name="$k"; done
+                    else
+                        __log "Content directory is required (-d <content_dir>)." -t error -l social
+                        return 1
+                    fi
+                fi
+
+                local base_dir="${SOCIAL_CONTENT_DIRS[$dir_name]:-}"
+                if [[ -z "$base_dir" ]]; then
+                    if [[ -d "$dir_name" ]]; then
+                        base_dir="$(cd "$dir_name" && pwd)"
+                    else
+                        __log "Content directory '$dir_name' is not registered. Run 'social content set $dir_name <path>'." -t error -l social
+                        return 1
+                    fi
+                fi
+
+                if [[ -z "$content_name" ]]; then
+                    read -r -p "Content file name (e.g. my-post): " content_name </dev/tty
+                    [[ -z "$content_name" ]] && { __log "Aborted: missing content name." -t error -l social; return 1; }
+                fi
+
+                content_name="${content_name%.md}"
+                content_name="${content_name%.markdown}"
+                local target_file="${base_dir%/}/${content_name}.md"
+                mkdir -p "$(dirname "$target_file")" 2>/dev/null || true
+
+                if [[ ! -f "$target_file" ]]; then
+                    __social_write_template_to "$plat" "$tmpl_name" "$target_file" || return 1
+                fi
+
+                "${EDITOR:-vim}" "$target_file" </dev/tty >/dev/tty
+                __log "Created/updated content '$content_name' in '$dir_name' -> $target_file" -t success -l social
+                ;;
+
+            rm|delete)
+                local target_name="" dir_name=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        -d|--dir) dir_name="$2"; shift 2 ;;
+                        --dir=*)  dir_name="${1#*=}"; shift ;;
+                        *)        [[ -z "$target_name" ]] && target_name="$1"; shift ;;
+                    esac
+                done
+                [[ -z "$target_name" ]] && { __log "Usage: social content rm <content_or_dir> [-d <content_dir>]" -t error -l social; return 1; }
+
+                if [[ -z "$dir_name" && -n "${SOCIAL_CONTENT_DIRS[$target_name]:-}" ]]; then
+                    unset "SOCIAL_CONTENT_DIRS[$target_name]"
+                    __social_save_omnirc
+                    __log "Unregistered content directory '$target_name'." -t success -l social
+                    return 0
+                fi
+
+                local resolved=""
+                if resolved="$(__social_resolve_content_file "$target_name" "$dir_name")"; then
+                    rm -f "$resolved"
+                    __log "Removed content file: $resolved" -t success -l social
+                else
+                    __log "Content '$target_name' not found." -t error -l social
+                    return 1
+                fi
+                ;;
+
+            *)
+                __log "Unknown content command: '$subcmd' (use set, ls, get, edit, new, rm)." -t error -l social
+                return 1
+                ;;
+        esac
+    }
+
+    __social_helper_publish() {
+        __social_load_omnirc
+        local sub="${1:-}"
+        local content_name="" dir_name="" plat_arg="" tmpl_name="default" t_env="${ENV:-global}"
+        local force_edit=0 yes_flag=0 count=10
+
+        if [[ "$sub" == "ls" || "$sub" == "list" || "$sub" == "rm" || "$sub" == "delete" ]]; then
+            shift
+            local target_urn=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    -p|-P|--platform) plat_arg="$2"; shift 2 ;;
+                    --platform=*)     plat_arg="${1#*=}"; shift ;;
+                    -c|--count)       count="$2"; shift 2 ;;
+                    -E|-e|--env)      t_env="$2"; shift 2 ;;
+                    *)                [[ -z "$target_urn" ]] && target_urn="$1"; shift ;;
+                esac
+            done
+            [[ -z "$plat_arg" ]] && plat_arg="lnkd"
+            local p_type="$(__social_resolve_platform_type "$plat_arg" "$t_env")"
+            local acc_name="$plat_arg"
+            if [[ -n "${SOCIAL_PLATFORMS[${t_env}::${plat_arg}]:-}" ]]; then
+                acc_name="$(__social_kv_get "${SOCIAL_PLATFORMS[${t_env}::${plat_arg}]}" "account")"
+            elif [[ -z "${SOCIAL_ACCOUNTS[${t_env}::lnkd::${acc_name}]:-}" ]]; then
+                acc_name="default"
+            fi
+
+            case "$p_type" in
+                lnkd)
+                    if [[ "$sub" == "ls" || "$sub" == "list" ]]; then
+                        __social_lnkd_ls -a "$acc_name" -c "$count" -e "$t_env"
+                    else
+                        __social_lnkd_rm "$target_urn" -a "$acc_name" -e "$t_env"
+                    fi
+                    return $?
+                    ;;
+                *)
+                    __log "Unsupported platform: '$plat_arg'" -t error -l social
+                    return 1
+                    ;;
+            esac
+        fi
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d|--dir)         dir_name="$2"; shift 2 ;;
+                --dir=*)          dir_name="${1#*=}"; shift ;;
+                -p|-P|--platform) plat_arg="$2"; shift 2 ;;
+                --platform=*)     plat_arg="${1#*=}"; shift ;;
+                -t|--template)    tmpl_name="$2"; shift 2 ;;
+                --template=*)     tmpl_name="${1#*=}"; shift ;;
+                -E|--env)         t_env="$2"; shift 2 ;;
+                --env=*)          t_env="${1#*=}"; shift ;;
+                -e|--edit)        force_edit=1; shift ;;
+                -y|--yes)         yes_flag=1; shift ;;
+                -*)
+                    __log "Unknown option for 'social publish': $1" -t error -l social
+                    return 1
+                    ;;
+                *)
+                    [[ -z "$content_name" ]] && content_name="$1"
+                    shift
+                    ;;
+            esac
+        done
+
+        local resolved_file=""
+        if [[ -n "$content_name" ]]; then
+            if ! resolved_file="$(__social_resolve_content_file "$content_name" "$dir_name")"; then
+                __log "Content '$content_name' not found${dir_name:+ in directory '$dir_name'}." -t error -l social
+                return 1
+            fi
+            __social_parse_markdown "$resolved_file"
+
+            if __social_is_draft "${SOCIAL_FM[draft]:-false}" && (( ! force_edit )); then
+                __log "Refusing to publish '$content_name': frontmatter has 'draft: ${SOCIAL_FM[draft]}'. Set 'draft: false' (or pass -e to edit)." -t warning -l social
+                return 1
+            fi
+            [[ -z "$plat_arg" ]] && plat_arg="${SOCIAL_FM[platform]:-lnkd}"
+        else
+            [[ -z "$plat_arg" ]] && plat_arg="lnkd"
+        fi
+
+        local p_key="${t_env}::${plat_arg}"
+        local plat_type="" acc_name=""
+        if [[ -n "${SOCIAL_PLATFORMS[$p_key]:-}" ]]; then
+            local p_data="${SOCIAL_PLATFORMS[$p_key]}"
+            plat_type="$(__social_normalize_platform "$(__social_kv_get "$p_data" "type")")"
+            acc_name="$(__social_kv_get "$p_data" "account")"
+        else
+            plat_type="$(__social_normalize_platform "$plat_arg")"
+            if [[ -n "${SOCIAL_ACCOUNTS[${t_env}::lnkd::${plat_arg}]:-}" ]]; then
+                plat_type="lnkd"
+                acc_name="$plat_arg"
+            fi
+        fi
+
+        case "$plat_type" in
+            lnkd)
+                local -a post_args=(-E "$t_env" -t "$tmpl_name")
+                [[ -n "$resolved_file" ]] && post_args+=(-f "$resolved_file")
+                [[ -n "$acc_name" ]]      && post_args+=(-a "$acc_name")
+                (( force_edit ))          && post_args+=(-e)
+                (( yes_flag ))            && post_args+=(-y)
+                __social_lnkd_post "${post_args[@]}"
+                ;;
+            *)
+                __log "Unsupported or unregistered platform: '$plat_arg'. Register it with 'social platform set $plat_arg -t linkedin ...'" -t error -l social
+                return 1
+                ;;
+        esac
+    }
+
+    __social_helper_template() {
+        __social_load_omnirc
+        local subcmd="${1:-ls}"
+        [[ $# -gt 0 ]] && shift
+
+        local plat="" name="" dir_arg="" target_path="" file_path="" show_templates=0 show_dirs=0
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -p|-P|--platform) plat="$2"; shift 2 ;;
+                --platform=*)     plat="${1#*=}"; shift ;;
+                -d|--dir)         dir_arg="$2"; shift 2 ;;
+                --dir=*)          dir_arg="${1#*=}"; shift ;;
+                --path)           target_path="$2"; shift 2 ;;
+                --path=*)         target_path="${1#*=}"; shift ;;
+                -f|--file)        file_path="$2"; shift 2 ;;
+                --file=*)         file_path="${1#*=}"; shift ;;
+                -t|--templates)   show_templates=1; shift ;;
+                --dirs)           show_dirs=1; shift ;;
+                -*)
+                    __log "Unknown template option: $1" -t error -l social
+                    return 1
+                    ;;
+                *)
+                    if [[ -z "$name" ]]; then
+                        name="$1"
+                    elif [[ -z "$target_path" ]]; then
+                        target_path="$1"
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+
+        case "$subcmd" in
+            ls|list)
+                local filter_dir="${dir_arg:-$name}"
+                local filter_plat=""
+                [[ -n "$plat" ]] && filter_plat="$(__social_resolve_platform_type "$plat")"
+
+                if [[ -n "$filter_dir" ]]; then
+                    local resolved_d=""
+                    if ! resolved_d="$(__social_resolve_template_dir "$filter_dir" "${plat:-lnkd}")"; then
+                        __log "Template directory '$filter_dir' is not registered." -t error -l social
+                        return 1
+                    fi
+                    local resolve_p="${plat:-lnkd}"
+                    printf "[%s] (%s) - platform: %s\n" "$filter_dir" "$resolved_d" "$resolve_p"
+                    local t_name r_path any_t=0
+                    for t_name in $(__social_list_template_names "$resolve_p" "$filter_dir"); do
+                        if r_path="$(__social_resolve_template_path "$resolve_p" "$t_name" "$filter_dir")"; then
+                            printf "  %-18s -> %s\n" "$t_name" "$r_path"
+                            any_t=1
+                        fi
+                    done
+                    (( ! any_t )) && echo "  (no templates found)"
+                    return 0
+                fi
+
+                if (( ! show_templates && ! show_dirs )); then
+                    show_dirs=1
+                    show_templates=1
+                fi
+
+                if (( show_dirs )); then
+                    echo "Template Directories:"
+                    local d_found=0 k
+                    if [[ -d "$_SOCIAL_DIR/templates" ]]; then
+                        printf "  [builtin] %-16s -> %s\n" "builtin" "$_SOCIAL_DIR/templates"
+                        d_found=1
+                    fi
+                    if [[ -d "${OMNI:-$HOME/.omni}/social/templates" ]]; then
+                        printf "  [omni]    %-16s -> %s\n" "user" "${OMNI:-$HOME/.omni}/social/templates"
+                        d_found=1
+                    fi
+                    for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do
+                        local k_plat="${k%%::*}"
+                        local k_name="${k#*::}"
+                        if [[ -n "$filter_plat" && "$k_plat" != "$filter_plat" && "$k_plat" != "$plat" && "$k_plat" != "all" ]]; then
+                            continue
+                        fi
+                        printf "  [%s]%-*s %-16s -> %s\n" "$k_plat" $(( 7 - ${#k_plat} )) "" "$k_name" "${SOCIAL_TEMPLATE_DIRS[$k]}"
+                        d_found=1
+                    done
+                    (( ! d_found )) && echo "  (none)"
+                fi
+
+                if (( show_templates )); then
+                    (( show_dirs )) && echo ""
+                    local resolve_p="${plat:-lnkd}"
+                    echo "Available Templates ($resolve_p):"
+                    local t_name r_path
+                    for t_name in $(__social_list_template_names "$resolve_p"); do
+                        if r_path="$(__social_resolve_template_path "$resolve_p" "$t_name")"; then
+                            printf "  %-18s -> %s\n" "$t_name" "$r_path"
+                        else
+                            printf "  %-18s -> (built-in)\n" "$t_name"
+                        fi
+                    done
+                fi
+                ;;
+
+            set|add)
+                [[ -z "$target_path" && -n "$dir_arg" ]] && target_path="$dir_arg"
+                if [[ -z "$target_path" && -n "$name" && ( -d "$name" || "$name" == */* ) ]]; then
+                    target_path="$name"
+                    name="${target_path%/}"
+                    name="${name##*/}"
+                fi
+
+                local scope_plat="all"
+                [[ -n "$plat" ]] && scope_plat="$(__social_resolve_platform_type "$plat")"
+
+                if [[ -n "$target_path" ]]; then
+                    if [[ -f "$target_path" ]]; then
+                        file_path="$target_path"
+                    else
+                        mkdir -p "$target_path" 2>/dev/null || {
+                            __log "Cannot create or access directory: $target_path" -t error -l social
+                            return 1
+                        }
+                        local abs_dir
+                        abs_dir="$(cd "$target_path" 2>/dev/null && pwd)"
+                        [[ -z "$name" ]] && name="${abs_dir##*/}"
+
+                        SOCIAL_TEMPLATE_DIRS["${scope_plat}::${name}"]="$abs_dir"
+                        __social_save_omnirc
+                        __log "Registered template directory '$name' (scope: $scope_plat) -> $abs_dir" -t success -l social
+                        return 0
+                    fi
+                fi
+
+                if [[ -n "$file_path" ]]; then
+                    [[ "$scope_plat" == "all" ]] && scope_plat="lnkd"
+                    name="${name%.md}"
+                    [[ -z "$name" ]] && name="${file_path##*/}" && name="${name%.md}"
+                    [[ ! -f "$file_path" ]] && { __log "Template file not found: $file_path" -t error -l social; return 1; }
+                    local abs_file
+                    abs_file="$(cd "$(dirname "$file_path")" && pwd)/$(basename "$file_path")"
+                    SOCIAL_TEMPLATES["${scope_plat}::${name}"]="$abs_file"
+                    __social_save_omnirc
+                    __log "Registered template file '$name' ($scope_plat) -> $abs_file" -t success -l social
+                    return 0
+                fi
+
+                __log "Usage: social template set <dir_name> <dir_path> [-p <platform>]" -t error -l social
+                return 1
+                ;;
+
+            new|create)
+                local tmpl_name="${name%.md}"
+                tmpl_name="${tmpl_name%.markdown}"
+                local scope_plat="lnkd"
+                [[ -n "$plat" ]] && scope_plat="$(__social_resolve_platform_type "$plat")"
+
+                if [[ -z "$tmpl_name" ]]; then
+                    read -r -p "Template name (e.g. announcement): " tmpl_name </dev/tty
+                    tmpl_name="${tmpl_name%.md}"
+                    [[ -z "$tmpl_name" ]] && { __log "Usage: social template new <template> -d/--dir <template_dir> [-p <platform>]" -t error -l social; return 1; }
+                fi
+
+                if [[ -z "$dir_arg" ]]; then
+                    if [[ ${#SOCIAL_TEMPLATE_DIRS[@]} -eq 1 ]]; then
+                        local k
+                        for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do dir_arg="${k#*::}"; done
+                    else
+                        __log "Usage: social template new <template> -d/--dir <template_dir> [-p <platform>]" -t error -l social
+                        return 1
+                    fi
+                fi
+
+                local base_dir=""
+                local is_global_dir=0
+                if [[ -n "${SOCIAL_TEMPLATE_DIRS[all::${dir_arg}]:-}" ]]; then
+                    base_dir="${SOCIAL_TEMPLATE_DIRS[all::${dir_arg}]}"
+                    is_global_dir=1
+                elif ! base_dir="$(__social_resolve_template_dir "$dir_arg" "${plat:-lnkd}")"; then
+                    __log "Template directory '$dir_arg' is not registered. Register it first with: social template set $dir_arg <path>" -t error -l social
+                    return 1
+                fi
+
+                local target_dir="${base_dir%/}"
+                if [[ -n "$plat" && $is_global_dir -eq 1 ]]; then
+                    target_dir="${target_dir}/${scope_plat}"
+                elif [[ -d "${target_dir}/${scope_plat}" ]]; then
+                    target_dir="${target_dir}/${scope_plat}"
+                fi
+
+                mkdir -p "$target_dir" 2>/dev/null || {
+                    __log "Cannot create directory: $target_dir" -t error -l social
+                    return 1
+                }
+
+                local dest_file="${target_dir}/${tmpl_name}.md"
+                if [[ ! -f "$dest_file" ]]; then
+                    __social_builtin_template "$scope_plat" "$tmpl_name" > "$dest_file"
+                fi
+
+                "${EDITOR:-vim}" "$dest_file" </dev/tty >/dev/tty
+                SOCIAL_TEMPLATES["${scope_plat}::${tmpl_name}"]="$dest_file"
+                __social_save_omnirc
+                __log "Created template '$tmpl_name' in '$dir_arg' -> $dest_file" -t success -l social
+                ;;
+
+            rm|delete)
+                [[ -z "$name" ]] && { __log "Template directory or template name is required." -t error -l social; return 1; }
+                local removed=0
+                local scope_plat=""
+                [[ -n "$plat" ]] && scope_plat="$(__social_resolve_platform_type "$plat")"
+
+                if [[ -n "$dir_arg" ]]; then
+                    local resolved_t=""
+                    if resolved_t="$(__social_resolve_template_path "${plat:-lnkd}" "$name" "$dir_arg")"; then
+                        rm -f "$resolved_t"
+                        unset "SOCIAL_TEMPLATES[${scope_plat:-lnkd}::${name%.md}]"
+                        __social_save_omnirc
+                        __log "Removed template '$name' from '$dir_arg' ($resolved_t)." -t success -l social
+                        return 0
+                    else
+                        __log "Template '$name' not found in template directory '$dir_arg'." -t error -l social
+                        return 1
+                    fi
+                fi
+
+                if [[ -n "$scope_plat" && -n "${SOCIAL_TEMPLATE_DIRS[${scope_plat}::${name}]:-}" ]]; then
+                    unset "SOCIAL_TEMPLATE_DIRS[${scope_plat}::${name}]"
+                    removed=1
+                fi
+                if [[ -n "${SOCIAL_TEMPLATE_DIRS[all::${name}]:-}" ]]; then
+                    unset "SOCIAL_TEMPLATE_DIRS[all::${name}]"
+                    removed=1
+                fi
+                local k
+                for k in "${!SOCIAL_TEMPLATE_DIRS[@]}"; do
+                    if [[ -z "$scope_plat" && "$k" == *"::${name}" ]]; then
+                        unset "SOCIAL_TEMPLATE_DIRS[$k]"
+                        removed=1
+                    elif [[ "${SOCIAL_TEMPLATE_DIRS[$k]}" == "${name%/}" ]]; then
+                        unset "SOCIAL_TEMPLATE_DIRS[$k]"
+                        removed=1
+                    fi
+                done
+
+                local clean_name="${name%.md}"
+                for k in "${!SOCIAL_TEMPLATES[@]}"; do
+                    if [[ ( -z "$scope_plat" || "$k" == "${scope_plat}::"* ) && "$k" == *"::${clean_name}" ]]; then
+                        unset "SOCIAL_TEMPLATES[$k]"
+                        removed=1
+                    fi
+                done
+
+                if (( removed )); then
+                    __social_save_omnirc
+                    __log "Removed '$name' from registered templates." -t success -l social
+                else
+                    __log "No registered template directory or template named '$name' found." -t error -l social
+                    return 1
+                fi
+                ;;
+
+            edit)
+                local scope_plat="lnkd"
+                [[ -n "$plat" ]] && scope_plat="$(__social_resolve_platform_type "$plat")"
+                [[ -z "$name" ]] && name="default"
+                local path=""
+                if ! path="$(__social_resolve_template_path "$scope_plat" "$name" "$dir_arg")"; then
+                    if [[ -n "$dir_arg" ]]; then
+                        __social_helper_template new "$name" -d "$dir_arg" ${plat:+-p "$plat"}
+                        return $?
+                    fi
+                    local user_dir="${OMNI:-$HOME/.omni}/social/templates/${scope_plat}"
+                    mkdir -p "$user_dir" 2>/dev/null || true
+                    path="${user_dir}/${name%.md}.md"
+                    __social_builtin_template "$scope_plat" "$name" > "$path"
+                    SOCIAL_TEMPLATES["${scope_plat}::${name%.md}"]="$path"
+                    __social_save_omnirc
+                fi
+                "${EDITOR:-vim}" "$path" </dev/tty >/dev/tty
+                __log "Updated template '$name' ($scope_plat) at $path" -t success -l social
+                ;;
+
+            get|show|cat)
+                local scope_plat="lnkd"
+                [[ -n "$plat" ]] && scope_plat="$(__social_resolve_platform_type "$plat")"
+                [[ -z "$name" ]] && name="default"
+                local path=""
+                if path="$(__social_resolve_template_path "$scope_plat" "$name" "$dir_arg")"; then
+                    cat "$path"
+                elif [[ -z "$dir_arg" ]]; then
+                    __social_builtin_template "$scope_plat" "$name"
+                else
+                    __log "Template '$name' not found in '$dir_arg'." -t error -l social
+                    return 1
+                fi
+                ;;
+
+            *)
+                __log "Unknown template command: '$subcmd' (use ls, set, new, rm, edit, get)." -t error -l social
+                return 1
+                ;;
+        esac
+    }
+}

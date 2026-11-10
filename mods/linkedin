@@ -1,0 +1,1176 @@
+#! /bin/bash
+
+__linkedin__() {
+    _LNKD_API_REST="https://api.linkedin.com/rest"
+    _LNKD_API_V2="https://api.linkedin.com/v2"
+    printf -v _LNKD_CUR_YEAR "%(%Y)T" -1
+    printf -v _LNKD_CUR_MON "%(%m)T" -1
+    local _y=$(( 10#$_LNKD_CUR_YEAR )) _m=$(( 10#$_LNKD_CUR_MON - 2 ))
+    if (( _m <= 0 )); then _m=$(( _m + 12 )); (( _y-- )); fi
+    printf -v _LNKD_DEFAULT_VERSION "%04d%02d" "$_y" "$_m"
+
+    __social_lnkd_resolve_account() {
+        __social_load_omnirc
+        local req_acc="$1" t_env="${2:-${ENV:-global}}"
+        if [[ -z "$req_acc" ]]; then
+            req_acc="${SOCIAL_DEFAULTS["${t_env}::lnkd"]:-default}"
+        fi
+
+        local key="${t_env}::lnkd::${req_acc}"
+        local data="${SOCIAL_ACCOUNTS[$key]:-}"
+        if [[ -z "$data" ]]; then
+            __log "LinkedIn account '$req_acc' is not connected in env '$t_env'. Run 'social platform set <name> -t linkedin --client-id <ID> --client-secret <SECRET>'." -t error -l social
+            return 1
+        fi
+
+        _LNKD_ACC="$req_acc"
+        _LNKD_ENV="$t_env"
+        _LNKD_KEY="$key"
+        _LNKD_TOKEN="$(__social_kv_get "$data" "token")"
+        _LNKD_URN="$(__social_kv_get "$data" "urn")"
+        _LNKD_VERSION="$(__social_kv_get "$data" "version")"
+        _LNKD_NAME="$(__social_kv_get "$data" "name")"
+        if [[ -z "$_LNKD_VERSION" || "$_LNKD_VERSION" -lt 202506 ]]; then
+            _LNKD_VERSION="$_LNKD_DEFAULT_VERSION"
+        fi
+        return 0
+    }
+
+    __social_lnkd_do_curl() {
+        local method="$1" url="$2" payload="${3:-}" ver="${4:-$_LNKD_VERSION}"
+        local -a headers=(
+            -H "Authorization: Bearer ${_LNKD_TOKEN}"
+        )
+        if [[ "$url" == *"/rest/"* || "$url" == *"/v2/ugcPosts"* || "$url" == *"/v2/shares"* ]]; then
+            headers+=(-H "X-Restli-Protocol-Version: 2.0.0")
+        fi
+        if [[ "$url" == *"/rest/"* ]]; then
+            headers+=(-H "Linkedin-Version: ${ver}")
+        fi
+        if [[ -n "$payload" ]]; then
+            headers+=(-H "Content-Type: application/json")
+        fi
+
+        local tmp_hdr tmp_body
+        tmp_hdr="$(mktemp)"
+        tmp_body="$(mktemp)"
+
+        local http_code
+        if [[ -n "$payload" ]]; then
+            http_code=$(curl -sS -X "$method" "${headers[@]}" -D "$tmp_hdr" -o "$tmp_body" -w "%{http_code}" -d "$payload" "$url" 2>/dev/null)
+        else
+            http_code=$(curl -sS -X "$method" "${headers[@]}" -D "$tmp_hdr" -o "$tmp_body" -w "%{http_code}" "$url" 2>/dev/null)
+        fi
+
+        _LNKD_HTTP_CODE="$http_code"
+        _LNKD_RESP_BODY="$(cat "$tmp_body" 2>/dev/null)"
+        _LNKD_RESP_HEADERS="$(cat "$tmp_hdr" 2>/dev/null)"
+
+        rm -f "$tmp_hdr" "$tmp_body"
+    }
+
+    __social_lnkd_request() {
+        local method="$1" url="$2" payload="${3:-}"
+        __social_lnkd_do_curl "$method" "$url" "$payload" "$_LNKD_VERSION"
+
+        if [[ "$_LNKD_HTTP_CODE" == "426" && "$url" == *"/rest/"* ]]; then
+            local cand_ver
+            for cand_ver in "$_LNKD_DEFAULT_VERSION" 202611 202610 202609 202608 202607 202606 202605 202604 202603 202602 202601 202511 202510 202509 202508 202507 202506; do
+                [[ "$cand_ver" == "$_LNKD_VERSION" ]] && continue
+                __social_lnkd_do_curl "$method" "$url" "$payload" "$cand_ver"
+                if [[ "$_LNKD_HTTP_CODE" != "426" ]]; then
+                    _LNKD_VERSION="$cand_ver"
+                    local data="${SOCIAL_ACCOUNTS[$_LNKD_KEY]:-}"
+                    if [[ -n "$data" ]]; then
+                        data="$(LC_ALL=C awk -v d="$data" -v v="$cand_ver" 'BEGIN {
+                            if (d ~ /version:[0-9]+/) sub(/version:[0-9]+/, "version:" v, d)
+                            else d = d ",version:" v
+                            printf "%s", d
+                        }')"
+                        SOCIAL_ACCOUNTS["$_LNKD_KEY"]="$data"
+                        __social_save_omnirc
+                    fi
+                    break
+                fi
+            done
+        fi
+
+        if [[ "$_LNKD_HTTP_CODE" -ge 200 && "$_LNKD_HTTP_CODE" -lt 300 ]]; then
+            return 0
+        else
+            return 1
+        fi
+    }
+
+    __social_lnkd_upload_image() {
+        local img_path="$1"
+        if [[ "$img_path" == urn:li:image:* ]]; then
+            printf "%s" "$img_path"
+            return 0
+        fi
+        if [[ ! -f "$img_path" ]]; then
+            __log "Thumbnail/image file not found: $img_path" -t error -l social
+            return 1
+        fi
+
+        local esc_owner init_payload
+        esc_owner="$(__social_json_escape "$_LNKD_URN")"
+        init_payload="{\"initializeUploadRequest\":{\"owner\":\"${esc_owner}\"}}"
+
+        __log "Initializing LinkedIn image upload for '$img_path'..." -t info -l social
+        if ! __social_lnkd_request "POST" "${_LNKD_API_REST}/images?action=initializeUpload" "$init_payload"; then
+            __log "Failed to initialize image upload (HTTP $_LNKD_HTTP_CODE): $_LNKD_RESP_BODY" -t error -l social
+            return 1
+        fi
+
+        local upload_url image_urn
+        upload_url="$(__social_json_val "$_LNKD_RESP_BODY" "uploadUrl")"
+        image_urn="$(__social_json_val "$_LNKD_RESP_BODY" "image")"
+
+        if [[ -z "$upload_url" || -z "$image_urn" ]]; then
+            __log "Could not parse uploadUrl or image URN from LinkedIn response." -t error -l social
+            return 1
+        fi
+
+        local put_code
+        put_code=$(curl -sS -X PUT \
+            -H "Authorization: Bearer ${_LNKD_TOKEN}" \
+            -H "Content-Type: application/octet-stream" \
+            --upload-file "$img_path" \
+            -o /dev/null -w "%{http_code}" \
+            "$upload_url" 2>/dev/null)
+
+        if [[ "$put_code" -lt 200 || "$put_code" -ge 300 ]]; then
+            __log "Failed to upload image binary to LinkedIn (HTTP $put_code)." -t error -l social
+            return 1
+        fi
+
+        printf "%s" "$image_urn"
+        return 0
+    }
+
+    __social_lnkd_pretty_json() {
+        LC_ALL=C awk '
+        BEGIN {
+            indent = 0
+            in_str = 0
+            esc = 0
+        }
+        {
+            len = length($0)
+            for (i = 1; i <= len; i++) {
+                c = substr($0, i, 1)
+                if (in_str) {
+                    printf "%s", c
+                    if (esc) esc = 0
+                    else if (c == "\\") esc = 1
+                    else if (c == "\"") in_str = 0
+                } else {
+                    if (c == "\"") {
+                        in_str = 1
+                        printf "%s", c
+                    } else if (c == "{" || c == "[") {
+                        indent++
+                        printf "%s\n%*s", c, indent * 2, ""
+                    } else if (c == "}" || c == "]") {
+                        indent--
+                        if (indent < 0) indent = 0
+                        printf "\n%*s%s", indent * 2, "", c
+                    } else if (c == ",") {
+                        printf ",\n%*s", indent * 2, ""
+                    } else if (c == ":") {
+                        printf ": "
+                    } else if (c !~ /[[:space:]]/) {
+                        printf "%s", c
+                    }
+                }
+            }
+        }
+        END { printf "\n" }' <<< "$1"
+    }
+
+    __social_lnkd_cached_posts() {
+        __social_load_omnirc
+        local t_env="${ENV:-global}"
+        local acc="${SOCIAL_DEFAULTS["${t_env}::lnkd"]:-default}"
+        local key="${t_env}::lnkd::${acc}"
+        echo "${SOCIAL_CACHE[$key]:-}"
+    }
+
+    __social_lnkd_history_file() {
+        local dir="${OMNI:-$HOME/.omni}"
+        mkdir -p "$dir" 2>/dev/null || true
+        echo "$dir/social_lnkd_posts.tsv"
+    }
+
+    __social_lnkd_set() {
+        __social_load_omnirc
+        local acc="default" token="" urn="" display_name="" version="$_LNKD_DEFAULT_VERSION"
+        local client_id="" client_secret="" org_id="" t_env="${ENV:-global}"
+        local redirect_uri="http://localhost:8080/callback"
+        local scopes="openid profile email w_member_social"
+        local auth_code=""
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -a|--account)       acc="$2"; shift 2 ;;
+                --account=*)        acc="${1#*=}"; shift ;;
+                -t|--token)         token="$2"; shift 2 ;;
+                --token=*)          token="${1#*=}"; shift ;;
+                -u|--urn)           urn="$2"; shift 2 ;;
+                --urn=*)            urn="${1#*=}"; shift ;;
+                -n|--name)          display_name="$2"; shift 2 ;;
+                --name=*)           display_name="${1#*=}"; shift ;;
+                --org|--org-id)     org_id="$2"; shift 2 ;;
+                -v|--version)       version="$2"; shift 2 ;;
+                --version=*)        version="${1#*=}"; shift ;;
+                --client-id)        client_id="$2"; shift 2 ;;
+                --client-id=*)      client_id="${1#*=}"; shift ;;
+                --client-secret)    client_secret="$2"; shift 2 ;;
+                --client-secret=*)  client_secret="${1#*=}"; shift ;;
+                -r|--redirect)      redirect_uri="$2"; shift 2 ;;
+                --redirect=*)       redirect_uri="${1#*=}"; shift ;;
+                -s|--scopes)        scopes="$2"; shift 2 ;;
+                --scopes=*)         scopes="${1#*=}"; shift ;;
+                --code)             auth_code="$2"; shift 2 ;;
+                --code=*)           auth_code="${1#*=}"; shift ;;
+                -e|--env)           t_env="$2"; shift 2 ;;
+                --env=*)            t_env="${1#*=}"; shift ;;
+                -*)
+                    __log "Unknown option for linkedin set: $1" -t error -l social
+                    return 1
+                    ;;
+                *)
+                    if [[ "$1" == *"token:"* || "$1" == *"client_id:"* ]]; then
+                        local kv_t="$(__social_kv_get "$1" "token")"
+                        local kv_a="$(__social_kv_get "$1" "account")"
+                        local kv_u="$(__social_kv_get "$1" "urn")"
+                        local kv_v="$(__social_kv_get "$1" "version")"
+                        local kv_cid="$(__social_kv_get "$1" "client_id")"
+                        local kv_csec="$(__social_kv_get "$1" "client_secret")"
+                        [[ -n "$kv_t" ]] && token="$kv_t"
+                        [[ -n "$kv_a" ]] && acc="$kv_a"
+                        [[ -n "$kv_u" ]] && urn="$kv_u"
+                        [[ -n "$kv_v" ]] && version="$kv_v"
+                        [[ -n "$kv_cid" ]] && client_id="$kv_cid"
+                        [[ -n "$kv_csec" ]] && client_secret="$kv_csec"
+                    elif [[ -z "$token" ]]; then
+                        token="$1"
+                    elif [[ "$acc" == "default" ]]; then
+                        acc="$1"
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+
+        [[ -z "$token" ]] && token="${LINKEDIN_ACCESS_TOKEN:-}"
+
+        if [[ -z "$token" && -n "$client_id" && -n "$client_secret" ]]; then
+            __social_lnkd_oauth \
+                --client-id "$client_id" \
+                --client-secret "$client_secret" \
+                --redirect "$redirect_uri" \
+                --scopes "$scopes" \
+                --account "$acc" \
+                --env "$t_env" \
+                --version "$version" \
+                ${urn:+--urn "$urn"} \
+                ${org_id:+--org-id "$org_id"} \
+                ${auth_code:+--code "$auth_code"}
+            return $?
+        fi
+
+        if [[ -z "$token" ]]; then
+            __log "LinkedIn access token or (--client-id and --client-secret) is required." -t error -l social
+            return 1
+        fi
+
+        if [[ -n "$org_id" && -z "$urn" ]]; then
+            [[ "$org_id" == urn:li:* ]] && urn="$org_id" || urn="urn:li:organization:${org_id}"
+        fi
+
+        _LNKD_TOKEN="$token"
+        _LNKD_VERSION="$version"
+
+        if [[ -z "$urn" ]]; then
+            __log "Verifying LinkedIn token and resolving member URN..." -t info -l social
+            if __social_lnkd_request "GET" "${_LNKD_API_V2}/userinfo"; then
+                local sub_id
+                sub_id="$(__social_json_val "$_LNKD_RESP_BODY" "sub")"
+                display_name="$(__social_json_val "$_LNKD_RESP_BODY" "name")"
+                [[ -n "$sub_id" ]] && urn="urn:li:person:${sub_id}"
+            fi
+
+            if [[ -z "$urn" ]] && __social_lnkd_request "GET" "${_LNKD_API_V2}/me"; then
+                local me_id fn ln
+                me_id="$(__social_json_val "$_LNKD_RESP_BODY" "id")"
+                fn="$(__social_json_val "$_LNKD_RESP_BODY" "localizedFirstName")"
+                ln="$(__social_json_val "$_LNKD_RESP_BODY" "localizedLastName")"
+                display_name="${fn}${ln:+ $ln}"
+                [[ -n "$me_id" ]] && urn="urn:li:person:${me_id}"
+            fi
+        fi
+
+        if [[ -z "$urn" ]]; then
+            __log "Could not auto-detect LinkedIn URN from API (HTTP ${_LNKD_HTTP_CODE:-000}): ${_LNKD_RESP_BODY:-no body}" -t error -l social
+            return 1
+        fi
+
+        [[ "$urn" != urn:li:* ]] && urn="urn:li:person:${urn}"
+        display_name="${display_name//,/ }"
+
+        local entry="token:${token},urn:${urn},version:${version}"
+        [[ -n "$display_name" ]] && entry+=",name:${display_name}"
+        [[ -n "$client_id" ]] && entry+=",client_id:${client_id}"
+        [[ -n "$client_secret" ]] && entry+=",client_secret:${client_secret}"
+
+        local key="${t_env}::lnkd::${acc}"
+        SOCIAL_ACCOUNTS["$key"]="$entry"
+        if [[ -z "${SOCIAL_DEFAULTS["${t_env}::lnkd"]:-}" ]]; then
+            SOCIAL_DEFAULTS["${t_env}::lnkd"]="$acc"
+        fi
+        if [[ -z "${SOCIAL_PLATFORMS["${t_env}::${acc}"]:-}" ]]; then
+            local p_label="$acc"
+            [[ "$p_label" == "default" ]] && p_label="lnkd"
+            SOCIAL_PLATFORMS["${t_env}::${p_label}"]="type:linkedin,account:${acc}"
+        fi
+        __social_save_omnirc
+
+        __log "Connected LinkedIn account '$acc' (${urn}${display_name:+ - $display_name})." -t success -l social
+    }
+
+    __social_lnkd_oauth() {
+        local client_id="${LINKEDIN_CLIENT_ID:-}"
+        local client_secret="${LINKEDIN_CLIENT_SECRET:-}"
+        local redirect_uri="http://localhost:8080/callback"
+        local scopes="openid profile email w_member_social"
+        local acc="default" t_env="${ENV:-global}" code="" urn="" org_id="" version="$_LNKD_DEFAULT_VERSION"
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --client-id)     client_id="$2"; shift 2 ;;
+                --client-secret) client_secret="$2"; shift 2 ;;
+                -r|--redirect)   redirect_uri="$2"; shift 2 ;;
+                -s|--scopes)     scopes="$2"; shift 2 ;;
+                --code)          code="$2"; shift 2 ;;
+                -a|--account)    acc="$2"; shift 2 ;;
+                -u|--urn)        urn="$2"; shift 2 ;;
+                --org|--org-id)  org_id="$2"; shift 2 ;;
+                -v|--version)    version="$2"; shift 2 ;;
+                -e|--env)        t_env="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+
+        if [[ -z "$client_id" || -z "$client_secret" ]]; then
+            __log "Usage: social platform set <name> -t linkedin --client-id <ID> --client-secret <SECRET> [-r <redirect_uri>]" -t error -l social
+            return 1
+        fi
+
+        if [[ -z "$code" ]]; then
+            local enc_redirect enc_scopes auth_url state="omni_$RANDOM"
+            enc_redirect="$(__social_urlencode "$redirect_uri")"
+            enc_scopes="$(__social_urlencode "$scopes")"
+            auth_url="https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=${client_id}&redirect_uri=${enc_redirect}&state=${state}&scope=${enc_scopes}"
+
+            local port="8080"
+            if [[ "$redirect_uri" =~ localhost:([0-9]+) ]]; then
+                port="${BASH_REMATCH[1]}"
+            fi
+
+            local port_busy=0
+            if (echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1; then
+                port_busy=1
+            fi
+
+            if command -v nc >/dev/null 2>&1 && (( ! port_busy )); then
+                __log "Starting local OAuth callback listener on http://localhost:${port}/callback..." -t info -l social
+                printf "Authorize in your browser (or open):\n  %s\n\nWaiting for browser redirect...\n" "$auth_url"
+
+                if command -v xdg-open >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+                    (xdg-open "$auth_url" >/dev/null 2>&1 &)
+                fi
+
+                local pipe="/tmp/omni_lnkd_oauth_$$"
+                local req_file="/tmp/omni_lnkd_req_$$"
+                rm -f "$pipe" "$req_file"
+                mkfifo "$pipe"
+
+                local nc_cmd="nc -l 127.0.0.1 $port"
+                nc -h 2>&1 | grep -q '\-p' && nc_cmd="nc -l -p $port"
+                nc -h 2>&1 | grep -q '\-q' && nc_cmd="$nc_cmd -q 1"
+                nc -h 2>&1 | grep -q '\-N' && nc_cmd="$nc_cmd -N"
+
+                eval "$nc_cmd" < "$pipe" | (
+                    IFS= read -r req_line
+                    req_line="${req_line%$'\r'}"
+                    printf "%s\n" "$req_line" > "$req_file"
+                    while IFS= read -r hdr; do
+                        hdr="${hdr%$'\r'}"
+                        [[ -z "$hdr" ]] && break
+                    done
+                    local html_body="<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Omni Social</title><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#111;color:#eee}.box{text-align:center;padding:2rem;border:1px solid #333;border-radius:8px;background:#1a1a1a}h2{color:#4ade80;margin-top:0}</style></head><body><div class=\"box\"><h2>LinkedIn Connected!</h2><p>You can close this tab and return to your terminal.</p></div></body></html>"
+                    printf "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" "${#html_body}" "$html_body" > "$pipe"
+                )
+                rm -f "$pipe"
+
+                local captured_req=""
+                [[ -f "$req_file" ]] && captured_req="$(cat "$req_file")" && rm -f "$req_file"
+
+                if [[ "$captured_req" =~ [?\&]code=([^\&[:space:]]+) ]]; then
+                    code="${BASH_REMATCH[1]}"
+                elif [[ "$captured_req" == *"error="* ]]; then
+                    __log "LinkedIn returned an OAuth error: $captured_req" -t error -l social
+                    return 1
+                fi
+            else
+                if (( port_busy )); then
+                    __log "Port $port is currently in use by another server (use -r http://localhost:8081/callback and register it in LinkedIn to auto-capture without 404)." -t warning -l social
+                fi
+                printf "\n1. Ensure '%s' is registered in your LinkedIn App's Authorized Redirect URLs.\n" "$redirect_uri"
+                printf "2. Open the following URL in your browser to authorize LinkedIn:\n\n  %s\n\n" "$auth_url"
+
+                if command -v xdg-open >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+                    (xdg-open "$auth_url" >/dev/null 2>&1 &)
+                fi
+
+                read -r -p "Paste the redirected URL (or just the 'code' parameter): " raw_input
+                [[ -z "$raw_input" ]] && { __log "Authorization aborted: empty input." -t error -l social; return 1; }
+
+                if [[ "$raw_input" == *"error="* ]]; then
+                    __log "LinkedIn returned an OAuth error: $raw_input" -t error -l social
+                    return 1
+                elif [[ "$raw_input" =~ [?\&]code=([^\&[:space:]]+) ]]; then
+                    code="${BASH_REMATCH[1]}"
+                else
+                    code="$raw_input"
+                fi
+            fi
+        fi
+
+        __log "Exchanging authorization code for LinkedIn access token..." -t info -l social
+        local token_resp access_token id_token jwt_claims jwt_sub="" jwt_name=""
+        token_resp=$(curl -sS -X POST "https://www.linkedin.com/oauth/v2/accessToken" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "grant_type=authorization_code" \
+            --data-urlencode "code=${code}" \
+            --data-urlencode "client_id=${client_id}" \
+            --data-urlencode "client_secret=${client_secret}" \
+            --data-urlencode "redirect_uri=${redirect_uri}")
+
+        access_token="$(__social_json_val "$token_resp" "access_token")"
+        id_token="$(__social_json_val "$token_resp" "id_token")"
+
+        if [[ -n "$id_token" ]]; then
+            jwt_claims="$(__social_jwt_payload "$id_token")"
+            if [[ -n "$jwt_claims" ]]; then
+                jwt_sub="$(__social_json_val "$jwt_claims" "sub")"
+                jwt_name="$(__social_json_val "$jwt_claims" "name")"
+            fi
+        fi
+
+        if [[ -z "$access_token" ]]; then
+            __log "Failed to exchange code for access token: $token_resp" -t error -l social
+            return 1
+        fi
+
+        [[ -z "$urn" && -n "$jwt_sub" ]] && urn="urn:li:person:${jwt_sub}"
+
+        __social_lnkd_set \
+            --account "$acc" \
+            --token "$access_token" \
+            --client-id "$client_id" \
+            --client-secret "$client_secret" \
+            --version "$version" \
+            --env "$t_env" \
+            ${urn:+--urn "$urn"} \
+            ${jwt_name:+--name "$jwt_name"} \
+            ${org_id:+--org-id "$org_id"}
+    }
+
+    __social_lnkd_parse_posts() {
+        local json_body="$1" filter_query="${2:-}"
+        LC_ALL=C awk -v q="$filter_query" '
+        function extract(chunk, key,    pat, rest, out, esc, i, len, c) {
+            pat = "\"" key "\"[[:space:]]*:[[:space:]]*"
+            if (!match(chunk, pat)) return ""
+            rest = substr(chunk, RSTART + RLENGTH)
+            if (substr(rest, 1, 1) == "\"") {
+                rest = substr(rest, 2)
+                out = ""; esc = 0; len = length(rest)
+                for (i = 1; i <= len; i++) {
+                    c = substr(rest, i, 1)
+                    if (esc) {
+                        if (c == "n" || c == "r" || c == "t") out = out " "
+                        else out = out c
+                        esc = 0
+                    } else if (c == "\\") {
+                        esc = 1
+                    } else if (c == "\"") {
+                        break
+                    } else {
+                        out = out c
+                    }
+                }
+                return out
+            } else if (match(rest, /^[0-9]+/)) {
+                return substr(rest, RSTART, RLENGTH)
+            }
+            return ""
+        }
+        BEGIN {
+            RS = "\0"
+            ql = tolower(q)
+        }
+        {
+            raw = $0
+            idx = index(raw, "\"elements\"")
+            if (idx == 0) {
+                if (q == "") print "No posts found." > "/dev/stderr"
+                exit (q == "" ? 0 : 1)
+            }
+            raw = substr(raw, idx)
+            count = 0
+            ids = ""
+            while (match(raw, /"id"[[:space:]]*:[[:space:]]*"urn:li:(share|ugcPost):[0-9]+"/)) {
+                start = RSTART
+                urn_chunk = substr(raw, start)
+                urn = extract(urn_chunk, "id")
+                raw = substr(raw, start + RLENGTH)
+
+                next_pos = match(raw, /"id"[[:space:]]*:[[:space:]]*"urn:li:(share|ugcPost):[0-9]+"/)
+                if (next_pos > 0) {
+                    elem = urn_chunk substr(raw, 1, next_pos - 1)
+                } else {
+                    elem = urn_chunk raw
+                }
+
+                vis = extract(elem, "visibility")
+                if (vis == "") vis = "PUBLIC"
+                state = extract(elem, "lifecycleState")
+                if (state == "") state = "PUBLISHED"
+                created_ms = extract(elem, "createdAt")
+                if (created_ms == "") created_ms = extract(elem, "publishedAt")
+                text = extract(elem, "commentary")
+                gsub(/[[:space:]]+/, " ", text)
+                sub(/^ /, "", text); sub(/ $/, "", text)
+
+                if (ql != "") {
+                    if (index(tolower(text), ql) == 0 && index(tolower(urn), ql) == 0) {
+                        continue
+                    }
+                }
+
+                dt_str = (created_ms != "" ? substr(created_ms, 1, 10) : "N/A")
+                disp_text = text
+                if (q == "" && length(disp_text) > 80) {
+                    disp_text = substr(disp_text, 1, 77) "..."
+                }
+
+                printf "%-42s | %-10s | %-11s | %-9s | %s\n", urn, dt_str, vis, state, disp_text
+                ids = (ids == "" ? urn : ids " " urn)
+                count++
+            }
+
+            if (count == 0) {
+                if (q != "") {
+                    printf "No posts matching \"%s\".\n", q > "/dev/stderr"
+                    exit 1
+                } else {
+                    print "No posts found." > "/dev/stderr"
+                }
+            } else if (q == "") {
+                printf "___IDS___:%s\n", ids
+            }
+        }' <<< "$json_body"
+    }
+
+    __social_lnkd_local_posts() {
+        local hist_file
+        hist_file="$(__social_lnkd_history_file)"
+        local key="$1" count="${2:-10}" query="${3:-}"
+        if [[ ! -f "$hist_file" ]]; then
+            __log "No posts recorded yet. Publish one with: social lnkd post" -t info -l social
+            return 0
+        fi
+        LC_ALL=C awk -F'\t' -v k="$key" -v max_c="$count" -v q="$query" '
+        BEGIN { ql = tolower(q); n = 0 }
+        $1 == k {
+            if (ql != "" && index(tolower($5), ql) == 0 && index(tolower($2), ql) == 0) next
+            rows[++n] = sprintf("%-42s | %-16s | %-11s | %-9s | %s", $2, $3, $4, "PUBLISHED", $5)
+        }
+        END {
+            if (n == 0) {
+                if (ql != "") {
+                    printf "No posts matching \"%s\".\n", q > "/dev/stderr"
+                    exit 1
+                }
+                print "No posts found." > "/dev/stderr"
+                exit 0
+            }
+            start = (n > max_c ? n - max_c + 1 : 1)
+            for (i = n; i >= start; i--) print rows[i]
+        }' "$hist_file"
+    }
+
+    __social_lnkd_ls() {
+        local acc="" count=10 t_env="${ENV:-global}" raw=0 author_urn=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -a|--account) acc="$2"; shift 2 ;;
+                --account=*)  acc="${1#*=}"; shift ;;
+                -c|--count)   count="$2"; shift 2 ;;
+                --count=*)    count="${1#*=}"; shift ;;
+                -u|--urn)     author_urn="$2"; shift 2 ;;
+                -e|--env)     t_env="$2"; shift 2 ;;
+                --env=*)      t_env="${1#*=}"; shift ;;
+                --raw)        raw=1; shift ;;
+                *)            [[ -z "$acc" ]] && acc="$1"; shift ;;
+            esac
+        done
+
+        __social_lnkd_resolve_account "$acc" "$t_env" || return 1
+        local target_urn="${author_urn:-$_LNKD_URN}"
+        local enc_urn
+        enc_urn="$(__social_urlencode "$target_urn")"
+
+        local url="${_LNKD_API_REST}/posts?q=author&author=${enc_urn}&count=${count}&sortBy=LAST_MODIFIED"
+
+        if ! __social_lnkd_request "GET" "$url"; then
+            if [[ "$_LNKD_HTTP_CODE" == "403" ]]; then
+                __log "Note: LinkedIn restricts 'GET /rest/posts?q=author' to apps with 'r_member_social'. Showing posts tracked by Omni:" -t info -l social
+                __social_lnkd_local_posts "$_LNKD_KEY" "$count" ""
+                return $?
+            fi
+            __log "Failed to list LinkedIn posts (HTTP $_LNKD_HTTP_CODE): $_LNKD_RESP_BODY" -t error -l social
+            return 1
+        fi
+
+        if (( raw )); then
+            __social_lnkd_pretty_json "$_LNKD_RESP_BODY"
+            return 0
+        fi
+
+        local parsed_ids
+        parsed_ids="$(__social_lnkd_parse_posts "$_LNKD_RESP_BODY")"
+        local id_line="${parsed_ids##*___IDS___:}"
+        local table_out="${parsed_ids%___IDS___:*}"
+        [[ -n "$table_out" ]] && printf "%s" "$table_out"
+        if [[ -n "$id_line" && "$id_line" != "$parsed_ids" ]]; then
+            SOCIAL_CACHE["$_LNKD_KEY"]="${id_line%$'\n'}"
+            __social_save_omnirc
+        fi
+    }
+
+    __social_lnkd_post() {
+        local acc="" t_env="${ENV:-global}" msg="" file="" visibility=""
+        local article_url="" article_title="" article_desc="" thumb=""
+        local tmpl_name="default" force_edit=0 has_explicit_msg=0 yes_flag=0
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -a|--account)    acc="$2"; shift 2 ;;
+                --account=*)     acc="${1#*=}"; shift ;;
+                -E|--env)        t_env="$2"; shift 2 ;;
+                --env=*)         t_env="${1#*=}"; shift ;;
+                -t|--template)   tmpl_name="$2"; shift 2 ;;
+                --template=*)    tmpl_name="${1#*=}"; shift ;;
+                -e|--edit)       force_edit=1; shift ;;
+                -y|--yes)        yes_flag=1; shift ;;
+                -m|--message)    msg="$2"; has_explicit_msg=1; shift 2 ;;
+                --message=*)     msg="${1#*=}"; has_explicit_msg=1; shift ;;
+                -f|--file)       file="$2"; shift 2 ;;
+                --file=*)        file="${1#*=}"; shift ;;
+                -v|--visibility) visibility="${2^^}"; shift 2 ;;
+                --visibility=*)  visibility="${1#*=}"; visibility="${visibility^^}"; shift ;;
+                -u|--url)        article_url="$2"; shift 2 ;;
+                --url=*)         article_url="${1#*=}"; shift ;;
+                -T|--title)      article_title="$2"; shift 2 ;;
+                --title=*)       article_title="${1#*=}"; shift ;;
+                --thumb)         thumb="$2"; shift 2 ;;
+                --thumb=*)       thumb="${1#*=}"; shift ;;
+                -d|--desc)       article_desc="$2"; shift 2 ;;
+                --desc=*)        article_desc="${1#*=}"; shift ;;
+                -*)
+                    __log "Unknown option for 'social lnkd post': $1" -t error -l social
+                    return 1
+                    ;;
+                *)
+                    if [[ -z "$msg" ]]; then msg="$1"
+                    else msg="$msg $1"
+                    fi
+                    has_explicit_msg=1
+                    shift
+                    ;;
+            esac
+        done
+
+        local used_editor=0
+        local work_file=""
+        local is_temp_file=0
+
+        if [[ -n "$file" ]]; then
+            [[ ! -f "$file" ]] && { __log "File not found: $file" -t error -l social; return 1; }
+            work_file="$file"
+            if (( force_edit )); then
+                used_editor=1
+            else
+                __social_parse_markdown "$work_file"
+                if __social_is_draft "${SOCIAL_FM[draft]:-false}"; then
+                    __log "Post '$work_file' has 'draft: true' in frontmatter and will NOT be published." -t warning -l social
+                    return 1
+                fi
+                msg="${SOCIAL_BODY:-}"
+                [[ -z "$article_title" && -n "${SOCIAL_FM[title]:-}" ]] && article_title="${SOCIAL_FM[title]}"
+                [[ -z "$thumb" && -n "${SOCIAL_FM[thumb]:-}" ]]         && thumb="${SOCIAL_FM[thumb]}"
+                [[ -z "$article_url" && -n "${SOCIAL_FM[url]:-}" ]]     && article_url="${SOCIAL_FM[url]}"
+                [[ -z "$article_desc" && -n "${SOCIAL_FM[description]:-${SOCIAL_FM[desc]:-}}" ]] && article_desc="${SOCIAL_FM[description]:-${SOCIAL_FM[desc]:-}}"
+                [[ -z "$visibility" && -n "${SOCIAL_FM[visibility]:-}" ]] && visibility="${SOCIAL_FM[visibility]^^}"
+                [[ -z "$acc" && -n "${SOCIAL_FM[account]:-}" ]]         && acc="${SOCIAL_FM[account]}"
+            fi
+
+        elif (( ! has_explicit_msg || force_edit )); then
+            work_file="$(mktemp "/tmp/omni_social_lnkd_XXXXXX.md")"
+            is_temp_file=1
+            if ! __social_write_template_to "lnkd" "$tmpl_name" "$work_file"; then
+                rm -f "$work_file"
+                return 1
+            fi
+
+            if [[ -n "$article_title" || -n "$thumb" || -n "$article_url" || -n "$article_desc" || -n "$visibility" || -n "$acc" || -n "$msg" ]]; then
+                LC_ALL=C awk \
+                    -v t="$article_title" -v th="$thumb" -v u="$article_url" \
+                    -v d="$article_desc" -v vis="$visibility" -v a="$acc" -v m="$msg" '
+                BEGIN { state = 0 }
+                {
+                    if (NR == 1 && $0 ~ /^---[[:space:]]*$/) { state = 1; print; next }
+                    if (state == 1) {
+                        if ($0 ~ /^---[[:space:]]*$/) { state = 2; print; next }
+                        if (t != "" && $0 ~ /^title:/)       { printf "title: \"%s\"\n", t; next }
+                        if (th != "" && $0 ~ /^thumb:/)      { printf "thumb: \"%s\"\n", th; next }
+                        if (u != "" && $0 ~ /^url:/)         { printf "url: \"%s\"\n", u; next }
+                        if (d != "" && $0 ~ /^description:/) { printf "description: \"%s\"\n", d; next }
+                        if (vis != "" && $0 ~ /^visibility:/){ printf "visibility: %s\n", vis; next }
+                        if (a != "" && $0 ~ /^account:/)     { printf "account: %s\n", a; next }
+                    }
+                    print
+                }
+                END {
+                    if (m != "") printf "\n%s\n", m
+                }' "$work_file" > "${work_file}.tmp" && mv "${work_file}.tmp" "$work_file"
+            fi
+            used_editor=1
+        fi
+
+        if (( used_editor )); then
+            local initial_hash current_hash
+            initial_hash="$(cksum < "$work_file")"
+
+            while true; do
+                "${EDITOR:-vim}" "$work_file" </dev/tty >/dev/tty
+                local editor_ret=$?
+
+                if (( editor_ret != 0 )); then
+                    (( is_temp_file )) && rm -f "$work_file"
+                    __log "Aborted: Editor exited with non-zero status." -t warning -l social
+                    return 1
+                fi
+
+                current_hash="$(cksum < "$work_file")"
+                if (( is_temp_file )) && [[ "$initial_hash" == "$current_hash" ]]; then
+                    rm -f "$work_file"
+                    __log "Aborted: Template was not modified." -t warning -l social
+                    return 1
+                fi
+
+                __social_parse_markdown "$work_file"
+                msg="${SOCIAL_BODY:-}"
+                local fm_title="${article_title:-${SOCIAL_FM[title]:-}}"
+                local fm_thumb="${thumb:-${SOCIAL_FM[thumb]:-}}"
+                local fm_url="${article_url:-${SOCIAL_FM[url]:-}}"
+                [[ "$fm_url" == "https://" ]] && fm_url=""
+                local fm_desc="${article_desc:-${SOCIAL_FM[description]:-${SOCIAL_FM[desc]:-}}}"
+                local fm_vis="${visibility:-${SOCIAL_FM[visibility]:-PUBLIC}}"
+                fm_vis="${fm_vis^^}"
+                local fm_acc="${acc:-${SOCIAL_FM[account]:-default}}"
+                local fm_draft="${SOCIAL_FM[draft]:-false}"
+
+                # If draft: true in frontmatter, do NOT publish
+                if __social_is_draft "$fm_draft"; then
+                    if (( is_temp_file )); then
+                        local saved_draft="/tmp/omni_social_lnkd_draft.md"
+                        mv "$work_file" "$saved_draft"
+                        __log "Post is marked as 'draft: true' — NOT published. Saved draft at $saved_draft" -t warning -l social
+                    else
+                        __log "Post '$work_file' is marked as 'draft: true' — NOT published." -t warning -l social
+                    fi
+                    return 0
+                fi
+
+                if [[ -z "${msg//[[:space:]]/}" ]]; then
+                    (( is_temp_file )) && rm -f "$work_file"
+                    __log "Aborted: Post message content is empty." -t warning -l social
+                    return 1
+                fi
+
+                printf "\n================ LINKEDIN POST PREVIEW ================\n"
+                printf "  Account:     %s\n" "$fm_acc"
+                printf "  Visibility:  %s\n" "$fm_vis"
+                printf "  Draft:       %s\n" "$fm_draft"
+                [[ -n "$fm_title" ]] && printf "  Title:       %s\n" "$fm_title"
+                [[ -n "$fm_url" ]]   && printf "  URL:         %s\n" "$fm_url"
+                [[ -n "$fm_desc" ]]  && printf "  Description: %s\n" "$fm_desc"
+                [[ -n "$fm_thumb" ]] && printf "  Thumbnail:   %s\n" "$fm_thumb"
+                printf -- "-------------------------------------------------------\n"
+                printf "%s\n" "$msg"
+                printf "=======================================================\n"
+
+                if (( yes_flag )); then
+                    article_title="$fm_title"; thumb="$fm_thumb"; article_url="$fm_url"
+                    article_desc="$fm_desc"; visibility="$fm_vis"; acc="$fm_acc"
+                    break
+                fi
+
+                local ans=""
+                read -r -p "Publish this post to LinkedIn? [y/N/e(dit)]: " ans </dev/tty
+                case "${ans,,}" in
+                    y|yes)
+                        article_title="$fm_title"
+                        thumb="$fm_thumb"
+                        article_url="$fm_url"
+                        article_desc="$fm_desc"
+                        visibility="$fm_vis"
+                        acc="$fm_acc"
+                        break
+                        ;;
+                    e|edit)
+                        continue
+                        ;;
+                    *)
+                        if (( is_temp_file )); then
+                            local saved_draft="/tmp/omni_social_lnkd_draft.md"
+                            mv "$work_file" "$saved_draft"
+                            __log "Cancelled. Draft saved at $saved_draft" -t info -l social
+                        else
+                            __log "Cancelled. Post was not published." -t info -l social
+                        fi
+                        return 1
+                        ;;
+                esac
+            done
+
+            (( is_temp_file )) && rm -f "$work_file"
+        fi
+
+        [[ -z "$visibility" ]] && visibility="PUBLIC"
+
+        if [[ -z "${msg//[[:space:]]/}" ]]; then
+            __log "Aborted: Post message content is empty." -t warning -l social
+            return 1
+        fi
+
+        if [[ -n "$file" && $used_editor -eq 0 && $yes_flag -eq 0 ]]; then
+            printf "\n================ LINKEDIN POST PREVIEW ================\n"
+            printf "  File:        %s\n" "$file"
+            printf "  Account:     %s\n" "${acc:-default}"
+            printf "  Visibility:  %s\n" "$visibility"
+            [[ -n "$article_title" ]] && printf "  Title:       %s\n" "$article_title"
+            [[ -n "$article_url" ]]   && printf "  URL:         %s\n" "$article_url"
+            [[ -n "$article_desc" ]]  && printf "  Description: %s\n" "$article_desc"
+            [[ -n "$thumb" ]]         && printf "  Thumbnail:   %s\n" "$thumb"
+            printf -- "-------------------------------------------------------\n"
+            printf "%s\n" "$msg"
+            printf "=======================================================\n"
+
+            local ans=""
+            read -r -p "Publish this content to LinkedIn? [y/N]: " ans </dev/tty
+            case "${ans,,}" in
+                y|yes) ;;
+                *)
+                    __log "Cancelled. Content was not published." -t info -l social
+                    return 1
+                    ;;
+            esac
+        fi
+
+        __social_lnkd_resolve_account "$acc" "$t_env" || return 1
+
+        local thumb_urn=""
+        if [[ -n "$thumb" ]]; then
+            thumb_urn="$(__social_lnkd_upload_image "$thumb")" || return 1
+        fi
+
+        local esc_author esc_msg esc_vis payload
+        esc_author="$(__social_json_escape "$_LNKD_URN")"
+        esc_msg="$(__social_json_escape "$msg")"
+        esc_vis="$(__social_json_escape "$visibility")"
+
+        if [[ -n "$article_url" && "$article_url" != "https://" ]]; then
+            local esc_url esc_title esc_desc thumb_field=""
+            esc_url="$(__social_json_escape "$article_url")"
+            esc_title="$(__social_json_escape "${article_title:-$article_url}")"
+            esc_desc="$(__social_json_escape "${article_desc:-}")"
+            if [[ -n "$thumb_urn" ]]; then
+                thumb_field=",
+      \"thumbnail\": \"$(__social_json_escape "$thumb_urn")\""
+            fi
+            payload="{
+  \"author\": \"${esc_author}\",
+  \"commentary\": \"${esc_msg}\",
+  \"visibility\": \"${esc_vis}\",
+  \"distribution\": {
+    \"feedDistribution\": \"MAIN_FEED\",
+    \"targetEntities\": [],
+    \"thirdPartyDistributionChannels\": []
+  },
+  \"content\": {
+    \"article\": {
+      \"source\": \"${esc_url}\",
+      \"title\": \"${esc_title}\",
+      \"description\": \"${esc_desc}\"${thumb_field}
+    }
+  },
+  \"lifecycleState\": \"PUBLISHED\",
+  \"isReshareDisabledByAuthor\": false
+}"
+        elif [[ -n "$thumb_urn" ]]; then
+            local esc_img esc_title
+            esc_img="$(__social_json_escape "$thumb_urn")"
+            esc_title="$(__social_json_escape "${article_title:-Image}")"
+            payload="{
+  \"author\": \"${esc_author}\",
+  \"commentary\": \"${esc_msg}\",
+  \"visibility\": \"${esc_vis}\",
+  \"distribution\": {
+    \"feedDistribution\": \"MAIN_FEED\",
+    \"targetEntities\": [],
+    \"thirdPartyDistributionChannels\": []
+  },
+  \"content\": {
+    \"media\": {
+      \"title\": \"${esc_title}\",
+      \"id\": \"${esc_img}\"
+    }
+  },
+  \"lifecycleState\": \"PUBLISHED\",
+  \"isReshareDisabledByAuthor\": false
+}"
+        else
+            if [[ -n "$article_title" ]]; then
+                esc_msg="$(__social_json_escape "${article_title}"$'\n\n'"${msg}")"
+            fi
+            payload="{
+  \"author\": \"${esc_author}\",
+  \"commentary\": \"${esc_msg}\",
+  \"visibility\": \"${esc_vis}\",
+  \"distribution\": {
+    \"feedDistribution\": \"MAIN_FEED\",
+    \"targetEntities\": [],
+    \"thirdPartyDistributionChannels\": []
+  },
+  \"lifecycleState\": \"PUBLISHED\",
+  \"isReshareDisabledByAuthor\": false
+}"
+        fi
+
+        if ! __social_lnkd_request "POST" "${_LNKD_API_REST}/posts" "$payload"; then
+            __log "Failed to publish LinkedIn post (HTTP $_LNKD_HTTP_CODE): $_LNKD_RESP_BODY" -t error -l social
+            return 1
+        fi
+
+        local post_urn=""
+        while IFS= read -r hdr_line; do
+            hdr_line="${hdr_line%$'\r'}"
+            if [[ "${hdr_line,,}" == x-restli-id:* ]]; then
+                post_urn="${hdr_line#*:}"
+                post_urn="${post_urn#"${post_urn%%[![:space:]]*}"}"
+                break
+            fi
+        done <<< "$_LNKD_RESP_HEADERS"
+
+        if [[ -n "$post_urn" ]]; then
+            local cur_cache="${SOCIAL_CACHE[$_LNKD_KEY]:-}"
+            SOCIAL_CACHE["$_LNKD_KEY"]="${post_urn}${cur_cache:+ $cur_cache}"
+            __social_save_omnirc
+
+            local now_str clean_msg hist_file
+            printf -v now_str "%(%Y-%m-%d %H:%M)T" -1
+            clean_msg="${msg//$'\n'/ }"
+            clean_msg="${clean_msg//$'\t'/ }"
+            hist_file="$(__social_lnkd_history_file)"
+            printf "%s\t%s\t%s\t%s\t%s\n" "$_LNKD_KEY" "$post_urn" "$now_str" "$visibility" "$clean_msg" >> "$hist_file"
+        fi
+
+        __log "Published post to LinkedIn${post_urn:+: $post_urn}" -t success -l social
+        [[ -n "$post_urn" ]] && echo "$post_urn"
+        return 0
+    }
+
+    __social_lnkd_search() {
+        local acc="" t_env="${ENV:-global}" search_type="posts" query="" count=25
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -a|--account) acc="$2"; shift 2 ;;
+                --account=*)  acc="${1#*=}"; shift ;;
+                -e|--env)     t_env="$2"; shift 2 ;;
+                --env=*)      t_env="${1#*=}"; shift ;;
+                -t|--type)    search_type="$2"; shift 2 ;;
+                --type=*)     search_type="${1#*=}"; shift ;;
+                -c|--count)   count="$2"; shift 2 ;;
+                --count=*)    count="${1#*=}"; shift ;;
+                *)
+                    if [[ -z "$query" ]]; then query="$1"
+                    else query="$query $1"
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+
+        [[ -z "$query" ]] && { __log "Search query is required (e.g., social lnkd search <query>)." -t error -l social; return 1; }
+        __social_lnkd_resolve_account "$acc" "$t_env" || return 1
+
+        case "$search_type" in
+            org|organization)
+                local enc_vanity
+                enc_vanity="$(__social_urlencode "$query")"
+                local url="${_LNKD_API_REST}/organizations?q=vanityName&vanityName=${enc_vanity}"
+                if ! __social_lnkd_request "GET" "$url"; then
+                    __log "Organization search failed (HTTP $_LNKD_HTTP_CODE): $_LNKD_RESP_BODY" -t error -l social
+                    return 1
+                fi
+                __social_lnkd_pretty_json "$_LNKD_RESP_BODY"
+                ;;
+            posts|*)
+                local enc_urn
+                enc_urn="$(__social_urlencode "$_LNKD_URN")"
+                local url="${_LNKD_API_REST}/posts?q=author&author=${enc_urn}&count=${count}&sortBy=LAST_MODIFIED"
+                if ! __social_lnkd_request "GET" "$url"; then
+                    if [[ "$_LNKD_HTTP_CODE" == "403" ]]; then
+                        __social_lnkd_local_posts "$_LNKD_KEY" "$count" "$query"
+                        return $?
+                    fi
+                    __log "Search failed (HTTP $_LNKD_HTTP_CODE): $_LNKD_RESP_BODY" -t error -l social
+                    return 1
+                fi
+                __social_lnkd_parse_posts "$_LNKD_RESP_BODY" "$query"
+                ;;
+        esac
+    }
+
+    __social_lnkd_get() {
+        local acc="" t_env="${ENV:-global}" target=""
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -a|--account) acc="$2"; shift 2 ;;
+                --account=*)  acc="${1#*=}"; shift ;;
+                -e|--env)     t_env="$2"; shift 2 ;;
+                --env=*)      t_env="${1#*=}"; shift ;;
+                *)            [[ -z "$target" ]] && target="$1"; shift ;;
+            esac
+        done
+
+        [[ -z "$target" ]] && target="me"
+        __social_lnkd_resolve_account "$acc" "$t_env" || return 1
+
+        if [[ "$target" == "me" || "$target" == "profile" ]]; then
+            if __social_lnkd_request "GET" "${_LNKD_API_V2}/userinfo"; then
+                __social_lnkd_pretty_json "$_LNKD_RESP_BODY"
+                return 0
+            elif __social_lnkd_request "GET" "${_LNKD_API_V2}/me"; then
+                __social_lnkd_pretty_json "$_LNKD_RESP_BODY"
+                return 0
+            else
+                __log "Failed to fetch profile info (HTTP $_LNKD_HTTP_CODE): $_LNKD_RESP_BODY" -t error -l social
+                return 1
+            fi
+        fi
+
+        if [[ "$target" =~ ^[0-9]+$ ]]; then
+            target="urn:li:share:${target}"
+        fi
+
+        local enc_target
+        enc_target="$(__social_urlencode "$target")"
+
+        local url="${_LNKD_API_REST}/posts/${enc_target}"
+        if [[ "$target" == urn:li:organization:* ]]; then
+            local org_id="${target##*:}"
+            url="${_LNKD_API_REST}/organizations/${org_id}"
+        fi
+
+        if ! __social_lnkd_request "GET" "$url"; then
+            local hist_file
+            hist_file="$(__social_lnkd_history_file)"
+            if [[ "$_LNKD_HTTP_CODE" == "403" && -f "$hist_file" ]]; then
+                local found_local
+                found_local="$(LC_ALL=C awk -F'\t' -v k="$_LNKD_KEY" -v u="$target" '$1 == k && $2 == u {
+                    printf "{\n  \"id\": \"%s\",\n  \"createdAt\": \"%s\",\n  \"visibility\": \"%s\",\n  \"lifecycleState\": \"PUBLISHED\",\n  \"commentary\": \"%s\"\n}\n", $2, $3, $4, $5
+                }' "$hist_file")"
+                if [[ -n "$found_local" ]]; then
+                    printf "%s\n" "$found_local"
+                    return 0
+                fi
+            fi
+            __log "Failed to get '$target' from LinkedIn (HTTP $_LNKD_HTTP_CODE): $_LNKD_RESP_BODY" -t error -l social
+            return 1
+        fi
+
+        __social_lnkd_pretty_json "$_LNKD_RESP_BODY"
+    }
+
+    __social_lnkd_rm() {
+        local acc="" t_env="${ENV:-global}" target=""
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -a|--account) acc="$2"; shift 2 ;;
+                --account=*)  acc="${1#*=}"; shift ;;
+                -e|--env)     t_env="$2"; shift 2 ;;
+                --env=*)      t_env="${1#*=}"; shift ;;
+                -f|--force)   shift ;;
+                *)            [[ -z "$target" ]] && target="$1"; shift ;;
+            esac
+        done
+
+        if [[ -z "$target" ]]; then
+            __log "Post URN or ID is required (e.g., social lnkd rm urn:li:share:12345)." -t error -l social
+            return 1
+        fi
+
+        __social_lnkd_resolve_account "$acc" "$t_env" || return 1
+
+        if [[ "$target" =~ ^[0-9]+$ ]]; then
+            target="urn:li:share:${target}"
+        fi
+
+        local enc_target
+        enc_target="$(__social_urlencode "$target")"
+
+        if ! __social_lnkd_request "DELETE" "${_LNKD_API_REST}/posts/${enc_target}"; then
+            __log "Failed to remove LinkedIn post '$target' (HTTP $_LNKD_HTTP_CODE): $_LNKD_RESP_BODY" -t error -l social
+            return 1
+        fi
+
+        local cur_cache="${SOCIAL_CACHE[$_LNKD_KEY]:-}"
+        if [[ -n "$cur_cache" ]]; then
+            local new_cache="" u
+            for u in $cur_cache; do
+                [[ "$u" != "$target" ]] && new_cache+="${new_cache:+ }$u"
+            done
+            SOCIAL_CACHE["$_LNKD_KEY"]="$new_cache"
+            __social_save_omnirc
+        fi
+
+        local hist_file
+        hist_file="$(__social_lnkd_history_file)"
+        if [[ -f "$hist_file" ]]; then
+            LC_ALL=C awk -F'\t' -v k="$_LNKD_KEY" -v u="$target" '!($1 == k && $2 == u)' "$hist_file" > "${hist_file}.tmp" && mv "${hist_file}.tmp" "$hist_file"
+        fi
+
+        __log "Removed LinkedIn post '$target'." -t success -l social
+    }
+}

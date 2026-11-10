@@ -1,0 +1,295 @@
+#! /bin/bash
+
+_SOCIAL_DIR_RAW="${BASH_SOURCE[0]%/*}"
+[[ "$_SOCIAL_DIR_RAW" == "${BASH_SOURCE[0]}" ]] && _SOCIAL_DIR_RAW="."
+_SOCIAL_DIR="$(cd "$_SOCIAL_DIR_RAW" && pwd)"
+
+__social__() {
+    __load script helper   --from "$_SOCIAL_DIR/mods"
+    __load script linkedin --from "$_SOCIAL_DIR/mods"
+
+    __social__.__help__() {
+        cat <<'EOF' >&2
+ABOUT:
+    omni social media content, template, and publishing manager
+
+USAGE:
+    social <command> [args]
+
+COMMANDS:
+    platform <subcmd> [options]       Manage registered platform connections
+    content  <subcmd> [options]       Manage markdown content directories & files
+    template <subcmd> [options]       Manage template directories and post templates
+    publish  [<content>] [options]    Publish content to a registered platform
+
+PLATFORM COMMANDS:
+    social platform ls                [-e|--env <env>] [-a|--all]
+    social platform set <platform>    -t|--type <linkedin|...> [--client-id <id> --client-secret <sec> | --token <tok>]
+    social platform rm  <platform>    [-e|--env <env>]
+    social platform use <platform>    [-e|--env <env>]
+    social platform get <platform>    [<target_urn|me>] [-e|--env <env>]
+
+CONTENT COMMANDS:
+    social content set  <dir_name> <dir_path>
+    social content ls   [<dir_name>] [--dirs]
+    social content get  <content> [-d|--dir <content_dir>]
+    social content edit <content> [-d|--dir <content_dir>]
+    social content new  [<name>] -d|--dir <content_dir> [-t|--template <tmpl>] [-p|--platform <plat>]
+    social content rm   <content_or_dir> [-d|--dir <content_dir>]
+
+TEMPLATE COMMANDS:
+    social template ls                [<template_dir>] [-p|--platform <plat>] [-t|--templates] [--dirs]
+    social template set <dir_name>    <dir_path> [-p|--platform <plat>]
+    social template new <template>    -d|--dir <template_dir> [-p|--platform <plat>]
+    social template edit <template>   [-d|--dir <template_dir>] [-p|--platform <plat>]
+    social template get  <template>   [-d|--dir <template_dir>] [-p|--platform <plat>]
+    social template rm   <name>       [-d|--dir <template_dir>] [-p|--platform <plat>]
+
+PUBLISH COMMANDS:
+    social publish <content>          -d|--dir <content_dir> -p|--platform <platform> [-e|--edit] [-y|--yes]
+    social publish                    -p|--platform <platform> [-t|--template <tmpl>]
+    social publish ls                 -p|--platform <platform> [-c|--count <N>]
+    social publish rm <post_urn>      -p|--platform <platform>
+
+FLAGS:
+    -h, --help                        Show this help message
+EOF
+    }
+
+    social() {
+        local cmd="${1:-}"
+        if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+            __social__.__help__
+            return 0
+        fi
+        shift
+
+        case "$cmd" in
+            platform|platforms)
+                __social_helper_platform "$@"
+                ;;
+            content|contents)
+                __social_helper_content "$@"
+                ;;
+            template|templates|tmpl)
+                __social_helper_template "$@"
+                ;;
+            publish|pub)
+                __social_helper_publish "$@"
+                ;;
+            *)
+                __log "Unknown command '$cmd'. Use: social {platform|content|template|publish}" -t error -l social
+                __social__.__help__
+                return 1
+                ;;
+        esac
+    }
+
+    __social__.__compl__() {
+        local cur="${COMP_WORDS[COMP_CWORD]:-}"
+        local prev="${COMP_WORDS[COMP_CWORD-1]:-}"
+        local cmd1="${COMP_WORDS[1]:-}"
+        local cmd2="${COMP_WORDS[2]:-}"
+
+        if [[ $COMP_CWORD -eq 1 ]]; then
+            COMPREPLY=( $(compgen -W "platform content template publish --help -h" -- "$cur") )
+            return 0
+        fi
+
+        if [[ "$prev" == "-e" || "$prev" == "--env" || "$prev" == "-E" ]]; then
+            COMPREPLY=( $(compgen -W "${!ENVS[*]} ${ENVS[*]}" -- "$cur") )
+            return 0
+        fi
+
+        case "$cmd1" in
+            platform|platforms)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=( $(compgen -W "ls set rm use get" -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "-t" || "$prev" == "--type" ]]; then
+                    COMPREPLY=( $(compgen -W "linkedin" -- "$cur") )
+                    return 0
+                fi
+                case "$cmd2" in
+                    ls|list)
+                        COMPREPLY=( $(compgen -W "-e --env -a --all" -- "$cur") )
+                        ;;
+                    set|new)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-t --type --token -u --urn -v --version -e --env --client-id --client-secret -r --redirect" -- "$cur") )
+                        elif [[ $COMP_CWORD -eq 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$(__social_list_platforms)" -- "$cur") )
+                        fi
+                        ;;
+                    rm|delete|use|get|info)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-e --env" -- "$cur") )
+                        elif [[ $COMP_CWORD -eq 3 ]]; then
+                            COMPREPLY=( $(compgen -W "$(__social_list_platforms)" -- "$cur") )
+                        elif [[ "$cmd2" == "get" || "$cmd2" == "info" ]]; then
+                            COMPREPLY=( $(compgen -W "me profile $(__social_lnkd_cached_posts)" -- "$cur") )
+                        fi
+                        ;;
+                esac
+                ;;
+
+            content|contents)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=( $(compgen -W "ls set get edit new rm" -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "-d" || "$prev" == "--dir" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_content_dirs)" -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "--path" ]]; then
+                    COMPREPLY=( $(compgen -d -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "-p" || "$prev" == "-P" || "$prev" == "--platform" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_platforms)" -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "-t" || "$prev" == "--template" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_template_names "lnkd")" -- "$cur") )
+                    return 0
+                fi
+
+                local c_dir="" i
+                for ((i=2; i<COMP_CWORD; i++)); do
+                    if [[ "${COMP_WORDS[i]}" == "-d" || "${COMP_WORDS[i]}" == "--dir" ]]; then
+                        c_dir="${COMP_WORDS[i+1]:-}"
+                    elif [[ "${COMP_WORDS[i]}" == "--dir="* ]]; then
+                        c_dir="${COMP_WORDS[i]#*=}"
+                    fi
+                done
+
+                case "$cmd2" in
+                    ls|list)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --dir --dirs" -- "$cur") )
+                        else
+                            COMPREPLY=( $(compgen -W "$(__social_list_content_dirs)" -- "$cur") )
+                        fi
+                        ;;
+                    set)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "--path" -- "$cur") )
+                        elif [[ $COMP_CWORD -ge 4 ]]; then
+                            COMPREPLY=( $(compgen -d -- "$cur") )
+                        else
+                            COMPREPLY=( $(compgen -W "$(__social_list_content_dirs)" -- "$cur") )
+                        fi
+                        ;;
+                    get|edit)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --dir" -- "$cur") )
+                        else
+                            COMPREPLY=( $(compgen -W "$(__social_list_content_items "$c_dir")" -- "$cur") )
+                        fi
+                        ;;
+                    new)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --dir -t --template -p --platform" -- "$cur") )
+                        fi
+                        ;;
+                    rm|delete)
+                        if [[ "$cur" == -* ]]; then
+                            COMPREPLY=( $(compgen -W "-d --dir" -- "$cur") )
+                        else
+                            COMPREPLY=( $(compgen -W "$(__social_list_content_dirs) $(__social_list_content_items "$c_dir")" -- "$cur") )
+                        fi
+                        ;;
+                esac
+                ;;
+
+            template|templates|tmpl)
+                if [[ $COMP_CWORD -eq 2 ]]; then
+                    COMPREPLY=( $(compgen -W "ls set new rm edit get" -- "$cur") )
+                    return 0
+                fi
+                local t_plat="lnkd" i
+                for ((i=2; i<COMP_CWORD; i++)); do
+                    if [[ "${COMP_WORDS[i]}" == "-p" || "${COMP_WORDS[i]}" == "-P" || "${COMP_WORDS[i]}" == "--platform" ]]; then
+                        t_plat="$(__social_resolve_platform_type "${COMP_WORDS[i+1]:-lnkd}")"
+                    fi
+                done
+
+                if [[ "$prev" == "--path" ]]; then
+                    COMPREPLY=( $(compgen -d -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "-d" || "$prev" == "--dir" ]]; then
+                    if [[ "$cmd2" == "set" ]]; then
+                        COMPREPLY=( $(compgen -d -- "$cur") )
+                    else
+                        COMPREPLY=( $(compgen -W "$(__social_list_template_dirs "$t_plat")" -- "$cur") )
+                    fi
+                    return 0
+                fi
+                if [[ "$prev" == "-f" || "$prev" == "--file" ]]; then
+                    COMPREPLY=( $(compgen -f -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "-p" || "$prev" == "-P" || "$prev" == "--platform" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_platforms) linkedin" -- "$cur") )
+                    return 0
+                fi
+
+                if [[ "$cur" == -* ]]; then
+                    case "$cmd2" in
+                        ls|list)   COMPREPLY=( $(compgen -W "-d --dir -p --platform -t --templates --dirs" -- "$cur") ) ;;
+                        set)       COMPREPLY=( $(compgen -W "--path -p --platform -f --file" -- "$cur") ) ;;
+                        new)       COMPREPLY=( $(compgen -W "-d --dir -p --platform" -- "$cur") ) ;;
+                        rm|delete) COMPREPLY=( $(compgen -W "-d --dir -p --platform" -- "$cur") ) ;;
+                        *)         COMPREPLY=( $(compgen -W "-d --dir -p --platform" -- "$cur") ) ;;
+                    esac
+                elif [[ "$cmd2" == "set" && $COMP_CWORD -ge 4 ]]; then
+                    COMPREPLY=( $(compgen -d -- "$cur") )
+                elif [[ "$cmd2" == "ls" || "$cmd2" == "list" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_template_dirs "$t_plat")" -- "$cur") )
+                elif [[ "$cmd2" == "rm" || "$cmd2" == "delete" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_template_dirs "$t_plat") $(__social_list_template_names "$t_plat")" -- "$cur") )
+                elif [[ "$cmd2" == "edit" || "$cmd2" == "get" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_template_names "$t_plat")" -- "$cur") )
+                fi
+                ;;
+
+            publish|pub)
+                if [[ "$prev" == "-d" || "$prev" == "--dir" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_content_dirs)" -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "-p" || "$prev" == "--platform" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_platforms)" -- "$cur") )
+                    return 0
+                fi
+                if [[ "$prev" == "-t" || "$prev" == "--template" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_list_template_names "lnkd")" -- "$cur") )
+                    return 0
+                fi
+                local c_dir="" i
+                for ((i=2; i<COMP_CWORD; i++)); do
+                    if [[ "${COMP_WORDS[i]}" == "-d" || "${COMP_WORDS[i]}" == "--dir" ]]; then
+                        c_dir="${COMP_WORDS[i+1]:-}"
+                    elif [[ "${COMP_WORDS[i]}" == "--dir="* ]]; then
+                        c_dir="${COMP_WORDS[i]#*=}"
+                    fi
+                done
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-d --dir -p --platform -t --template -e --edit -y --yes -E --env" -- "$cur") )
+                elif [[ "$cmd2" == "rm" ]]; then
+                    COMPREPLY=( $(compgen -W "$(__social_lnkd_cached_posts)" -- "$cur") )
+                else
+                    COMPREPLY=( $(compgen -W "ls rm $(__social_list_content_items "$c_dir")" -- "$cur") )
+                fi
+                ;;
+        esac
+    }
+
+    __social__.__init__() {
+        unalias lnkd 2>/dev/null || true
+        __compl social
+    }
+}
